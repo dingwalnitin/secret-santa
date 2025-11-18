@@ -7,3 +7,5 @@ werkzeug
 python-dotenv
 email-validator
 cryptography
+gunicorn
+eventlet

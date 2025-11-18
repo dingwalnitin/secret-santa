@@ -1,4 +1,7 @@
 # app.py
+import eventlet
+eventlet.monkey_patch() 
+
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, current_app
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_login import LoginManager
@@ -16,7 +19,7 @@ app.config.from_object(Config)
 
 # Initialize extensions
 db.init_app(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode=app.config['SOCKETIO_ASYNC_MODE'])
+socketio = SocketIO(app, cors_allowed_origins="*", sync_mode='eventlet')
 
 # Create database tables
 with app.app_context():

@@ -1,0 +1,6 @@
+.env
+__pycache__/
+del_db.py
+instance/
+venv/
+pp.ipynb

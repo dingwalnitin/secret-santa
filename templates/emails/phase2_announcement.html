@@ -1,0 +1,110 @@
+<!-- templates/emails/phase2_announcement.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+            border-radius: 10px 10px 0 0;
+        }
+        .content {
+            background: #f9f9f9;
+            padding: 30px;
+            border-radius: 0 0 10px 10px;
+        }
+        .highlight-box {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .button {
+            display: inline-block;
+            padding: 15px 40px;
+            background: #f5576c;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            margin: 20px 0;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        .credentials {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid #f5576c;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            color: #666;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎉 Your Secret Santa Match is Ready!</h1>
+    </div>
+    <div class="content">
+        <h2>Hi {{ user.name }},</h2>
+        <p>Exciting news! The moment you've been waiting for is here!</p>
+        
+        <div class="highlight-box">
+            <h3>🎁 Phase 2 is Now Live!</h3>
+            <p>Login to discover who you'll be gifting this year!</p>
+        </div>
+        
+        <div class="credentials">
+            <h3>Your Login Credentials:</h3>
+            <p><strong>Email:</strong> {{ user.email }}</p>
+            <p><strong>Employee ID:</strong> {{ user.emp_id }}</p>
+        </div>
+        
+        <div style="text-align: center;">
+            <a href="{{ login_url }}" class="button">🎲 Reveal Your Match</a>
+        </div>
+        
+        <h3>What You Can Do Now:</h3>
+        <ul>
+            <li>🎲 Experience the exciting reveal animation</li>
+            <li>👤 Learn about your giftee's preferences</li>
+            <li>💬 Chat anonymously to get more gift ideas</li>
+            <li>🎁 Start planning the perfect gift!</li>
+        </ul>
+        
+        <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <p><strong>⚠️ Important Reminders:</strong></p>
+            <ul>
+                <li>Keep your identity secret</li>
+                <li>Respect the budget limit</li>
+                <li>Be thoughtful and kind</li>
+                <li>Have fun! 🎄</li>
+            </ul>
+        </div>
+        
+        <p>Happy Secret Santa!</p>
+        
+        <div class="footer">
+            <p>Secret Santa Application</p>
+            <p>This is an automated email. Please do not reply.</p>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,102 @@
+<!-- templates/user/dashboard.html -->
+{% extends "base.html" %}
+{% block title %}Dashboard - Secret Santa{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="dashboard-header">
+        <h1>Welcome back, {{ user.name }}! 🎅</h1>
+        <p class="subtitle">Your Secret Santa Dashboard</p>
+    </div>
+
+    <div class="dashboard-grid">
+        <!-- Your Giftee Card -->
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>🎁 Your Giftee</h2>
+            </div>
+            <div class="card-body">
+                <div class="giftee-info">
+                    <div class="info-row">
+                        <span class="label">Name:</span>
+                        <span class="value">{{ giftee.name }}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">Employee ID:</span>
+                        <span class="value">{{ giftee.emp_id }}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">Preferences:</span>
+                        <span class="value">{{ giftee.preferences }}</span>
+                    </div>
+                    {% if giftee.address %}
+                    <div class="info-row">
+                        <span class="label">Address:</span>
+                        <span class="value">{{ giftee.address }}</span>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Chat Cards Section -->
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>💬 Chat as Gifter</h2>
+                {% if unread_gifter_chat > 0 %}
+                <span class="badge badge-danger">{{ unread_gifter_chat }} new</span>
+                {% endif %}
+            </div>
+            <div class="card-body">
+                <p>Chat with your giftee ({{ giftee.name }}) anonymously to learn more about their preferences!</p>
+                <a href="{{ url_for('chat_as_gifter') }}" class="btn btn-primary">Open Chat</a>
+            </div>
+        </div>
+
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>💬 Chat as Giftee</h2>
+                {% if unread_giftee_chat > 0 %}
+                <span class="badge badge-danger">{{ unread_giftee_chat }} new</span>
+                {% endif %}
+            </div>
+            <div class="card-body">
+                <p>Chat with your Secret Santa ({{ gifter.name }}) anonymously!</p>
+                <a href="{{ url_for('chat_as_giftee') }}" class="btn btn-secondary">Open Chat</a>
+            </div>
+        </div>
+
+        <!-- Event Details Card -->
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>📋 Event Details</h2>
+            </div>
+            <div class="card-body">
+                <div class="info-row">
+                    <span class="label">Budget:</span>
+                    <span class="value">₹{{ budget }}</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Revealed On:</span>
+                    <span class="value">{{ assignment.reveal_time.strftime('%B %d, %Y at %I:%M %p') if assignment.reveal_time else 'N/A' }}</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Important Notes Card -->
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>ℹ️ Important Notes</h2>
+            </div>
+            <div class="card-body">
+                <ul class="notes-list">
+                    <li>Keep your identity secret from your giftee</li>
+                    <li>Stay within the budget of ₹{{ budget }}</li>
+                    <li>Use the anonymous chat to ask questions</li>
+                    <li>Have fun and spread joy! 🎄</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

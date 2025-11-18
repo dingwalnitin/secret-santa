@@ -1,0 +1,107 @@
+<!-- templates/admin/assignments.html -->
+{% extends "base.html" %}
+
+{% block title %}Assignments - Admin{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>🎁 Secret Santa Assignments</h1>
+        <div class="header-actions">
+            {% if not settings.assignments_generated %}
+            <form method="POST" action="{{ url_for('generate_assignments') }}" 
+                  onsubmit="return confirm('Generate new assignments? This will replace any existing assignments.');">
+                <button type="submit" class="btn btn-primary">🎲 Generate Assignments</button>
+            </form>
+            {% else %}
+            <a href="{{ url_for('export_assignments') }}" class="btn btn-secondary">
+                📥 Export CSV
+            </a>
+            {% endif %}
+        </div>
+    </div>
+    
+    {% if assignments %}
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Gifter</th>
+                    <th>Gifter Email</th>
+                    <th>→</th>
+                    <th>Giftee</th>
+                    <th>Giftee Email</th>
+                    <th>Reveal Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for assignment in assignments %}
+                <tr>
+                    <td>{{ assignment.gifter.name }}</td>
+                    <td>{{ assignment.gifter.email }}</td>
+                    <td class="text-center">→</td>
+                    <td>{{ assignment.giftee.name }}</td>
+                    <td>{{ assignment.giftee.email }}</td>
+                    <td>
+                        {% if assignment.reveal_completed %}
+                        <span class="badge badge-success">✅ Revealed</span>
+                        {% else %}
+                        <span class="badge badge-pending">⏳ Pending</span>
+                        {% endif %}
+                    </td>
+                    <td class="actions">
+                        <button class="btn btn-sm btn-secondary"
+                            onclick="openOverrideModal('{{ assignment.id }}')">
+
+                        </button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>No assignments generated yet. Click "Generate Assignments" to create matches.</p>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Override Modal -->
+<div id="overrideModal" class="modal">
+    <div class="modal-content">
+        <span class="close">&times;</span>
+        <h2>Override Assignment</h2>
+        <form id="overrideForm" method="POST">
+            <div class="form-group">
+                <label for="new_giftee_id">Select New Giftee</label>
+                <select id="new_giftee_id" name="new_giftee_id" required>
+                    <option value="">-- Select Giftee --</option>
+                    {% for assignment in assignments %}
+                    <option value="{{ assignment.giftee.id }}">{{ assignment.giftee.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button type="submit" class="btn btn-primary">Save Override</button>
+        </form>
+    </div>
+</div>
+
+<script>
+function openOverrideModal(assignmentId) {
+    const modal = document.getElementById('overrideModal');
+    const form = document.getElementById('overrideForm');
+    form.action = `/admin/assignments/${assignmentId}/override`;
+    modal.style.display = 'block';
+}
+
+document.querySelector('.close').onclick = function() {
+    document.getElementById('overrideModal').style.display = 'none';
+}
+</script>
+{% endblock %}

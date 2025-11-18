@@ -1,0 +1,56 @@
+<!-- templates/user/chat.html -->
+{% extends "base.html" %}
+{% block title %}Anonymous Chat - Secret Santa{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="chat-container">
+        <div class="chat-header">
+            <h2>💬 Anonymous Chat</h2>
+            <p>
+                {% if chat_mode == 'gifter' %}
+                Chatting with your giftee (anonymously)
+                {% else %}
+                Chatting with your Secret Santa (anonymously)
+                {% endif %}
+            </p>
+        </div>
+
+        <div class="chat-messages" id="chatMessages">
+            {% for message in messages %}
+            <div class="message {% if message.sender_type == 'gifter' %}message-sent{% else %}message-received{% endif %}">
+                <div class="message-content">
+                    <p>{{ message.message_text }}</p>
+                    <span class="message-time">
+                        {% if message.timestamp is string %}
+                            {{ message.timestamp.split('T')[1].split('.')[0] if 'T' in message.timestamp else message.timestamp }}
+                        {% else %}
+                            {{ message.timestamp.strftime('%I:%M %p') }}
+                        {% endif %}
+                    </span>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="chat-input-container">
+            <form id="chatForm" class="chat-form">
+                <input type="text" id="messageInput" placeholder="Type your message..."
+                        autocomplete="off" maxlength="500">
+                <button type="submit" class="btn btn-primary">Send</button>
+            </form>
+            <small class="chat-help">Messages are anonymous. Your identity remains secret.</small>
+        </div>
+    </div>
+</div>
+
+<script>
+    const chatMode = "{{ chat_mode }}";  // 'gifter' or 'giftee'
+    const assignmentId = "{{ assignment.id }}";
+</script>
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+{% endblock %}

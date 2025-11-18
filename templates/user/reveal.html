@@ -1,0 +1,68 @@
+<!-- templates/user/reveal.html -->
+{% extends "base.html" %}
+
+{% block title %}Reveal Your Match - Secret Santa{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/animations.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="reveal-container">
+        <h1>🎉 Discover Your Secret Santa Match!</h1>
+        <p class="reveal-subtitle">Spin the wheel to reveal who you'll be gifting...</p>
+        
+        {% if animation_type == 'spin' %}
+        <div class="spin-wheel-container">
+            <canvas id="wheelCanvas" width="500" height="500"></canvas>
+            <button id="spinButton" class="btn btn-primary btn-lg spin-btn">
+                🎲 SPIN THE WHEEL
+            </button>
+        </div>
+        {% else %}
+        <div class="scratch-cards-container">
+            <h2>Choose a card to scratch and reveal your match!</h2>
+            <div class="cards-grid">
+                <div class="scratch-card-wrapper">
+                    <canvas class="scratch-card" data-card="1"></canvas>
+                    <div class="card-back">{{ giftee_name }}</div>
+                </div>
+                <div class="scratch-card-wrapper">
+                    <canvas class="scratch-card" data-card="2"></canvas>
+                    <div class="card-back">{{ giftee_name }}</div>
+                </div>
+                <div class="scratch-card-wrapper">
+                    <canvas class="scratch-card" data-card="3"></canvas>
+                    <div class="card-back">{{ giftee_name }}</div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+        
+        <div id="resultModal" class="modal">
+            <div class="modal-content">
+                <h2>🎁 Your Secret Santa Match Is...</h2>
+                <div class="giftee-reveal">
+                    <h1 id="gifteeName">{{ giftee_name }}</h1>
+                </div>
+                <p>Get ready to make their day special!</p>
+                <a href="{{ url_for('user_dashboard') }}" class="btn btn-primary">Go to Dashboard</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const gifteeName = "{{ giftee_name }}";
+    const animationType = "{{ animation_type }}";
+</script>
+{% endblock %}
+
+{% block extra_js %}
+{% if animation_type == 'spin' %}
+<script src="{{ url_for('static', filename='js/spin-wheel.js') }}"></script>
+{% else %}
+<script src="{{ url_for('static', filename='js/scratch-card.js') }}"></script>
+{% endif %}
+{% endblock %}

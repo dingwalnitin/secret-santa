@@ -1,0 +1,3846 @@
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\app.py =====
+
+# app.py
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, current_app
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_login import LoginManager
+from config import Config
+from models import db, Admin, User, Assignment, ChatMessage, SystemSettings, LoginAttempt, ChatMessageGifter, ChatMessageGiftee
+from utils.email_service import EmailService
+from utils.assignment_logic import AssignmentGenerator
+from utils.auth import admin_required, user_required, check_rate_limit, log_login_attempt
+from datetime import datetime
+import os
+
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+# Initialize extensions
+db.init_app(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=app.config['SOCKETIO_ASYNC_MODE'])
+
+# Create database tables
+with app.app_context():
+    db.create_all()
+
+    # Initialize system settings if not exists
+    if not SystemSettings.query.first():
+        settings = SystemSettings()
+        db.session.add(settings)
+        db.session.commit()
+
+    # Check if admin exists, if not redirect to admin creation
+    if not Admin.query.first():
+        app.config['FIRST_RUN'] = True
+    else:
+        app.config['FIRST_RUN'] = False
+
+# ==================== HOME & REGISTRATION ====================
+@app.route('/')
+def index():
+    settings = SystemSettings.query.first()
+
+    # Check if first run (no admin)
+    if app.config.get('FIRST_RUN', False):
+        return redirect(url_for('admin_setup'))
+
+    return render_template('index.html',
+                           phase=settings.phase,
+                           registration_open=settings.registration_open)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    settings = SystemSettings.query.first()
+
+    # Check if registration is open
+    if settings.phase != 1 or not settings.registration_open:
+        flash('Registration is currently closed', 'error')
+        return redirect(url_for('index'))
+
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        emp_id = request.form.get('emp_id', '').strip()
+        email = request.form.get('email', '').strip().lower()
+        address = request.form.get('address', '').strip()
+        preferences = request.form.get('preferences', '').strip()
+
+        # Validation
+        if not all([name, emp_id, email, preferences]):
+            flash('All fields except address are required', 'error')
+            return render_template('register.html',
+                                   budget=app.config['GIFT_BUDGET'])
+
+        # Check company domain if configured
+        if app.config.get('COMPANY_DOMAIN'):
+            if not email.endswith(app.config["COMPANY_DOMAIN"]):
+                flash(f'Email must be from {app.config["COMPANY_DOMAIN"]}', 'error')
+                return render_template('register.html',
+                                       budget=app.config['GIFT_BUDGET'])
+
+        # Check if emp_id or email already exists
+        if User.query.filter_by(emp_id=emp_id).first():
+            flash('Employee ID already registered', 'error')
+            return render_template('register.html',
+                                   budget=app.config['GIFT_BUDGET'])
+
+        if User.query.filter_by(email=email).first():
+            flash('Email already registered', 'error')
+            return render_template('register.html',
+                                   budget=app.config['GIFT_BUDGET'])
+
+        # Create user
+        user = User(
+            name=name,
+            emp_id=emp_id,
+            email=email,
+            address=address,
+            preferences=preferences
+        )
+
+        db.session.add(user)
+        db.session.commit()
+
+        # Send confirmation email
+        try:
+            EmailService.send_registration_confirmation(user)
+        except Exception as e:
+            app.logger.error(f"Failed to send confirmation email: {str(e)}")
+
+        return render_template('register_success.html', user=user)
+
+    return render_template('register.html',
+                           budget=app.config['GIFT_BUDGET'])
+
+# ==================== USER LOGIN & AUTHENTICATION ====================
+@app.route('/login', methods=['GET', 'POST'])
+def user_login():
+    settings = SystemSettings.query.first()
+
+    # Check if Phase 2 is active
+    if settings.phase != 2:
+        flash('Login is only available during Phase 2', 'info')
+        return redirect(url_for('index'))
+
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        emp_id = request.form.get('emp_id', '').strip()
+
+        ip_address = request.remote_addr
+
+        # Rate limiting
+        if not check_rate_limit(ip_address):
+            flash('Too many failed login attempts. Please try again later.', 'error')
+            return render_template('login.html')
+
+        user = User.query.filter_by(email=email, emp_id=emp_id).first()
+
+        if user:
+            session['user_id'] = user.id
+            session.permanent = True
+            user.last_login = datetime.utcnow()
+            db.session.commit()
+
+            log_login_attempt(ip_address, email, True)
+
+            return redirect(url_for('user_dashboard'))
+        else:
+            log_login_attempt(ip_address, email, False)
+            flash('Invalid email or employee ID', 'error')
+
+    return render_template('login.html')
+
+@app.route('/logout')
+def user_logout():
+    session.pop('user_id', None)
+    flash('You have been logged out', 'success')
+    return redirect(url_for('index'))
+
+# ==================== USER DASHBOARD ====================
+@app.route('/dashboard')
+@user_required
+def user_dashboard():
+    user = User.query.get(session['user_id'])
+
+    # Find assignment where user is either gifter or giftee
+    assignment = Assignment.query.filter(
+        (Assignment.gifter_user_id == user.id) | (Assignment.giftee_user_id == user.id)
+    ).first()
+
+    if not assignment:
+        flash('No assignment found. Please contact admin.', 'error')
+        return redirect(url_for('index'))
+
+    # Determine the user's role for this assignment
+    is_gifter = (assignment.gifter_user_id == user.id)
+
+    # Provide both objects to the template so it can render both chat cards
+    gifter = assignment.gifter
+    giftee = assignment.giftee
+
+    # Unread counts:
+    # - unread_gifter_chat: unread messages in the "as gifter" view (messages sent by giftee)
+    # - unread_giftee_chat: unread messages in the "as giftee" view (messages sent by gifter)
+    try:
+        unread_gifter_chat = ChatMessageGifter.query.filter_by(
+            assignment_id=assignment.id,
+            sender_type='giftee',
+            read=False
+        ).count()
+    except Exception:
+        # If role-specific tables don't exist (legacy), fallback to ChatMessage
+        unread_gifter_chat = ChatMessage.query.filter_by(
+            assignment_id=assignment.id,
+            sender_type='giftee',
+            read=False
+        ).count()
+
+    try:
+        unread_giftee_chat = ChatMessageGiftee.query.filter_by(
+            assignment_id=assignment.id,
+            sender_type='gifter',
+            read=False
+        ).count()
+    except Exception:
+        unread_giftee_chat = ChatMessage.query.filter_by(
+            assignment_id=assignment.id,
+            sender_type='gifter',
+            read=False
+        ).count()
+
+    # If reveal not completed, direct to reveal flow
+    if not assignment.reveal_completed:
+        return redirect(url_for('reveal'))
+
+    return render_template(
+        'user/dashboard.html',
+        user=user,
+        gifter=gifter,
+        giftee=giftee,
+        assignment=assignment,
+        is_gifter=is_gifter,
+        unread_gifter_chat=unread_gifter_chat,
+        unread_giftee_chat=unread_giftee_chat,
+        budget=current_app.config['GIFT_BUDGET']
+    )
+# ==================== REVEAL ANIMATION ====================
+@app.route('/reveal')
+@user_required
+def reveal():
+    user = User.query.get(session['user_id'])
+    assignment = Assignment.query.filter_by(gifter_user_id=user.id).first()
+
+    if not assignment:
+        flash('No assignment found', 'error')
+        return redirect(url_for('user_dashboard'))
+
+    if assignment.reveal_completed:
+        return redirect(url_for('user_dashboard'))
+
+    # Get giftee name (all cards/segments will show this)
+    giftee_name = assignment.giftee.name
+
+    return render_template('user/reveal.html',
+                           giftee_name=giftee_name,
+                           animation_type='spin')  # or 'scratch'
+
+@app.route('/api/complete-reveal', methods=['POST'])
+@user_required
+def complete_reveal():
+    user = User.query.get(session['user_id'])
+    assignment = Assignment.query.filter_by(gifter_user_id=user.id).first()
+
+    if assignment and not assignment.reveal_completed:
+        assignment.reveal_completed = True
+        assignment.reveal_time = datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({'success': True})
+
+    return jsonify({'success': False}), 400
+
+# Continue to Part 2...
+# ==================== CHAT FUNCTIONALITY ====================
+@app.route('/chat')
+@user_required
+def chat():
+    user = User.query.get(session['user_id'])
+    assignment = Assignment.query.filter(
+        (Assignment.gifter_user_id == user.id) | (Assignment.giftee_user_id == user.id)
+    ).first()
+    settings = SystemSettings.query.first()
+
+    if not assignment or not assignment.reveal_completed:
+        flash('Please complete the reveal first', 'error')
+        return redirect(url_for('reveal'))
+
+    if not settings.chat_enabled:
+        flash('Chat is currently disabled', 'error')
+        return redirect(url_for('user_dashboard'))
+
+    # Determine role and pick the right table
+    is_gifter = (assignment.gifter_user_id == user.id)
+
+    if is_gifter:
+        messages = ChatMessageGifter.query.filter_by(assignment_id=assignment.id).order_by(ChatMessageGifter.timestamp).all()
+        # Mark messages from giftee as read in gifter table
+        ChatMessageGifter.query.filter_by(assignment_id=assignment.id, sender_type='giftee', read=False).update({'read': True})
+    else:
+        messages = ChatMessageGiftee.query.filter_by(assignment_id=assignment.id).order_by(ChatMessageGiftee.timestamp).all()
+        # Mark messages from gifter as read in giftee table
+        ChatMessageGiftee.query.filter_by(assignment_id=assignment.id, sender_type='gifter', read=False).update({'read': True})
+
+    db.session.commit()
+
+    # Convert role-specific model objects to a common shape for template (use to_dict)
+    messages_list = [m.to_dict() for m in messages]
+
+    return render_template('user/chat.html',
+                           user=user,
+                           assignment=assignment,
+                           messages=messages_list,
+                           is_gifter=is_gifter)
+
+# ==================== ADMIN SETUP (First Run) ====================
+@app.route('/admin/setup', methods=['GET', 'POST'])
+def admin_setup():
+    # Check if admin already exists
+    if Admin.query.first():
+        return redirect(url_for('admin_login'))
+
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+
+        # Validation
+        if not all([name, email, password]):
+            flash('All fields are required', 'error')
+            return render_template('admin/setup.html')
+
+        if password != confirm_password:
+            flash('Passwords do not match', 'error')
+            return render_template('admin/setup.html')
+
+        if len(password) < 8:
+            flash('Password must be at least 8 characters', 'error')
+            return render_template('admin/setup.html')
+
+        # Create admin
+        admin = Admin(name=name, email=email)
+        admin.set_password(password)
+        db.session.add(admin)
+        db.session.commit()
+
+        app.config['FIRST_RUN'] = False
+
+        flash('Admin account created successfully! Please login.', 'success')
+        return redirect(url_for('admin_login'))
+
+    return render_template('admin/setup.html')
+
+# ==================== ADMIN LOGIN ====================
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    if 'admin_id' in session:
+        return redirect(url_for('admin_dashboard'))
+
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+
+        ip_address = request.remote_addr
+
+        # Rate limiting
+        if not check_rate_limit(ip_address):
+            flash('Too many failed login attempts. Please try again later.', 'error')
+            return render_template('admin/login.html')
+
+        admin = Admin.query.filter_by(email=email).first()
+
+        if admin and admin.check_password(password):
+            session['admin_id'] = admin.id
+            session.permanent = True
+            admin.last_login = datetime.utcnow()
+            db.session.commit()
+
+            log_login_attempt(ip_address, email, True)
+
+            return redirect(url_for('admin_dashboard'))
+        else:
+            log_login_attempt(ip_address, email, False)
+            flash('Invalid email or password', 'error')
+
+    return render_template('admin/login.html')
+
+@app.route('/admin/logout')
+def admin_logout():
+    session.pop('admin_id', None)
+    flash('You have been logged out', 'success')
+    return redirect(url_for('admin_login'))
+
+# ==================== ADMIN DASHBOARD ====================
+@app.route('/admin/dashboard')
+@admin_required
+def admin_dashboard():
+    settings = SystemSettings.query.first()
+
+    stats = {
+        'total_participants': User.query.count(),
+        'assignments_generated': settings.assignments_generated,
+        'reveals_completed': Assignment.query.filter_by(reveal_completed=True).count(),
+        'total_messages': ChatMessage.query.count(),
+        'phase': settings.phase
+    }
+
+    return render_template('admin/dashboard.html', stats=stats, settings=settings)
+
+# ==================== ADMIN PARTICIPANTS ====================
+@app.route('/admin/participants')
+@admin_required
+def admin_participants():
+    participants = User.query.all()
+    return render_template('admin/participants.html', participants=participants)
+
+@app.route('/admin/participants/<int:user_id>/edit', methods=['GET', 'POST'])
+@admin_required
+def edit_participant(user_id):
+    user = User.query.get_or_404(user_id)
+
+    if request.method == 'POST':
+        user.name = request.form.get('name', '').strip()
+        user.email = request.form.get('email', '').strip().lower()
+        user.address = request.form.get('address', '').strip()
+        user.preferences = request.form.get('preferences', '').strip()
+
+        db.session.commit()
+        flash('Participant updated successfully', 'success')
+        return redirect(url_for('admin_participants'))
+
+    return render_template('admin/edit_participant.html', user=user)
+
+@app.route('/admin/participants/<int:user_id>/delete', methods=['POST'])
+@admin_required
+def delete_participant(user_id):
+    user = User.query.get_or_404(user_id)
+
+    # Delete related assignments and messages
+    Assignment.query.filter(
+        (Assignment.gifter_user_id == user_id) | (Assignment.giftee_user_id == user_id)
+    ).delete()
+
+    db.session.delete(user)
+    db.session.commit()
+
+    flash('Participant deleted successfully', 'success')
+    return redirect(url_for('admin_participants'))
+
+@app.route('/admin/participants/export')
+@admin_required
+def export_participants():
+    import csv
+    from io import StringIO
+    from flask import make_response
+
+    participants = User.query.all()
+
+    si = StringIO()
+    writer = csv.writer(si)
+    writer.writerow(['Name', 'Employee ID', 'Email', 'Preferences', 'Address', 'Registered On'])
+
+    for user in participants:
+        writer.writerow([
+            user.name,
+            user.emp_id,
+            user.email,
+            user.preferences,
+            user.address,
+            user.created_at.strftime('%Y-%m-%d %H:%M:%S')
+        ])
+
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = "attachment; filename=participants.csv"
+    output.headers["Content-type"] = "text/csv"
+    return output
+
+# ==================== ADMIN ASSIGNMENTS ====================
+@app.route('/admin/assignments')
+@admin_required
+def admin_assignments():
+    settings = SystemSettings.query.first()
+    assignments = AssignmentGenerator.get_assignment_map()
+
+    return render_template('admin/assignments.html',
+                           assignments=assignments,
+                           settings=settings)
+
+@app.route('/admin/assignments/generate', methods=['POST'])
+@admin_required
+def generate_assignments():
+    try:
+        count = AssignmentGenerator.generate_assignments()
+
+        settings = SystemSettings.query.first()
+        settings.assignments_generated = True
+        db.session.commit()
+
+        flash(f'Successfully generated {count} assignments', 'success')
+    except Exception as e:
+        flash(f'Error generating assignments: {str(e)}', 'error')
+
+    return redirect(url_for('admin_assignments'))
+
+@app.route('/admin/assignments/export')
+@admin_required
+def export_assignments():
+    import csv
+    from io import StringIO
+    from flask import make_response
+
+    assignments = AssignmentGenerator.get_assignment_map()
+
+    si = StringIO()
+    writer = csv.writer(si)
+    writer.writerow(['Gifter Name', 'Gifter Email', 'Giftee Name', 'Giftee Email', 'Giftee Preferences', 'Reveal Completed'])
+
+    for assignment in assignments:
+        writer.writerow([
+            assignment['gifter']['name'],
+            assignment['gifter']['email'],
+            assignment['giftee']['name'],
+            assignment['giftee']['email'],
+            assignment['giftee']['preferences'],
+            'Yes' if assignment['reveal_completed'] else 'No'
+        ])
+
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = "attachment; filename=assignments.csv"
+    output.headers["Content-type"] = "text/csv"
+    return output
+
+@app.route('/admin/assignments/<int:assignment_id>/override', methods=['POST'])
+@admin_required
+def override_assignment(assignment_id):
+    new_giftee_id = request.form.get('new_giftee_id', type=int)
+
+    if not new_giftee_id:
+        flash('Invalid giftee selection', 'error')
+        return redirect(url_for('admin_assignments'))
+
+    assignment = Assignment.query.get_or_404(assignment_id)
+
+    # Validate no self-assignment
+    if assignment.gifter_user_id == new_giftee_id:
+        flash('Cannot assign a person to themselves', 'error')
+        return redirect(url_for('admin_assignments'))
+
+    assignment.giftee_user_id = new_giftee_id
+    assignment.reveal_completed = False
+    assignment.reveal_time = None
+    db.session.commit()
+
+    flash('Assignment updated successfully', 'success')
+    return redirect(url_for('admin_assignments'))
+
+# ==================== ADMIN SETTINGS ====================
+@app.route('/admin/settings', methods=['GET', 'POST'])
+@admin_required
+def admin_settings():
+    settings = SystemSettings.query.first()
+
+    if request.method == 'POST':
+        action = request.form.get('action')
+
+        if action == 'update_phase':
+            new_phase = request.form.get('phase', type=int)
+            if new_phase in [1, 2]:
+                settings.phase = new_phase
+
+                # If moving to Phase 2, notify all users
+                if new_phase == 2:
+                    users = User.query.all()
+                    for user in users:
+                        try:
+                            login_url = url_for('user_login', _external=True)
+                            EmailService.send_phase2_announcement(user, login_url)
+                        except Exception as e:
+                            app.logger.error(f"Failed to send email to {user.email}: {str(e)}")
+
+                db.session.commit()
+                flash(f'Phase updated to {new_phase}', 'success')
+
+        elif action == 'toggle_registration':
+            settings.registration_open = not settings.registration_open
+            db.session.commit()
+            status = "opened" if settings.registration_open else "closed"
+            flash(f'Registration {status}', 'success')
+
+        elif action == 'toggle_chat':
+            settings.chat_enabled = not settings.chat_enabled
+            db.session.commit()
+            status = "enabled" if settings.chat_enabled else "disabled"
+            flash(f'Chat {status}', 'success')
+
+        elif action == 'update_smtp':
+            settings.smtp_host = request.form.get('smtp_host', '').strip()
+            settings.smtp_port = request.form.get('smtp_port', type=int)
+            settings.smtp_user = request.form.get('smtp_user', '').strip()
+            settings.smtp_use_tls = request.form.get('smtp_use_tls') == 'on'
+
+            smtp_password = request.form.get('smtp_password', '').strip()
+            if smtp_password:
+                settings.set_smtp_password(smtp_password)
+
+            db.session.commit()
+            flash('SMTP settings updated successfully', 'success')
+
+        elif action == 'test_email':
+            test_email = request.form.get('test_email', '').strip()
+            if test_email:
+                success = EmailService.send_email(
+                    test_email,
+                    'Test Email from Secret Santa',
+                    '<h2>Test Email</h2><p>Your SMTP configuration is working correctly!</p>',
+                    'Test Email - Your SMTP configuration is working correctly!'
+                )
+                if success:
+                    flash('Test email sent successfully', 'success')
+                else:
+                    flash('Failed to send test email. Check your SMTP settings.', 'error')
+
+        elif action == 'reset_system':
+            # Confirm reset
+            if request.form.get('confirm_reset') == 'RESET':
+                # Archive or delete all data
+                Assignment.query.delete()
+                ChatMessage.query.delete()
+                User.query.delete()
+                LoginAttempt.query.delete()
+
+                settings.phase = 1
+                settings.assignments_generated = False
+                settings.registration_open = True
+
+                db.session.commit()
+                flash('System reset successfully. Ready for next year!', 'success')
+            else:
+                flash('Reset cancelled. Type RESET to confirm.', 'warning')
+
+        return redirect(url_for('admin_settings'))
+
+    return render_template('admin/settings.html', settings=settings)
+@app.route('/chat/gifter')
+@user_required
+def chat_as_gifter():
+    user = User.query.get(session['user_id'])
+    assignment = Assignment.query.filter_by(gifter_user_id=user.id).first()
+
+    messages = ChatMessageGifter.query \
+        .filter_by(assignment_id=assignment.id) \
+        .order_by(ChatMessageGifter.timestamp).all()
+
+    # Mark read (messages from giftee)
+    ChatMessageGifter.query.filter_by(
+        assignment_id=assignment.id,
+        sender_type='giftee',
+        read=False
+    ).update({'read': True})
+    db.session.commit()
+
+    return render_template(
+        'user/chat.html',
+        messages=[m.to_dict() for m in messages],
+        assignment=assignment,
+        is_gifter=True,
+        chat_mode='gifter'
+    )
+
+
+@app.route('/chat/giftee')
+@user_required
+def chat_as_giftee():
+    user = User.query.get(session['user_id'])
+    assignment = Assignment.query.filter_by(giftee_user_id=user.id).first()
+
+    messages = ChatMessageGiftee.query \
+        .filter_by(assignment_id=assignment.id) \
+        .order_by(ChatMessageGiftee.timestamp).all()
+
+    # Mark read (messages from gifter)
+    ChatMessageGiftee.query.filter_by(
+        assignment_id=assignment.id,
+        sender_type='gifter',
+        read=False
+    ).update({'read': True})
+    db.session.commit()
+
+    return render_template(
+        'user/chat.html',
+        messages=[m.to_dict() for m in messages],
+        assignment=assignment,
+        is_gifter=False,
+        chat_mode='giftee'
+    )
+
+# ==================== ADMIN CHAT MONITORING ====================
+@app.route('/admin/chats')
+@admin_required
+def admin_chats():
+    settings = SystemSettings.query.first()
+    if not settings.admin_can_view_chats:
+        flash('Chat monitoring is disabled', 'warning')
+        return redirect(url_for('admin_dashboard'))
+
+    assignments = Assignment.query.filter_by(reveal_completed=True).all()
+    chat_data = []
+
+    for assignment in assignments:
+        # get messages from both tables and merge
+        msgs_g = ChatMessageGifter.query.filter_by(assignment_id=assignment.id).all()
+        msgs_q = ChatMessageGiftee.query.filter_by(assignment_id=assignment.id).all()
+        # Prefer whichever has content; they should generally be identical
+        combined = sorted(
+            [m.to_dict() for m in msgs_g] + [m.to_dict() for m in msgs_q],
+            key=lambda x: x['timestamp']
+        )
+        chat_data.append({
+            'assignment': assignment,
+            'gifter': assignment.gifter,
+            'giftee': assignment.giftee,
+            'messages': combined
+        })
+
+    return render_template('admin/chats.html', chat_data=chat_data)
+
+# ==================== SOCKETIO CHAT EVENTS ====================
+from flask import session as flask_session
+# Note: models already imported at top
+
+@socketio.on('connect')
+def handle_connect():
+    # We keep connect minimal. Client should call join_chat explicitly.
+    # This prevents reliance on session being available during handshake.
+    current_app.logger.debug('Socket connected (sid=%s)', request.sid if hasattr(request, 'sid') else 'unknown')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    # Nothing special to do here; rooms are left automatically when socket disconnects.
+    current_app.logger.debug('Socket disconnected')
+
+@socketio.on('join_chat')
+def handle_join_chat(data):
+    """
+    Client requests to join a chat room for an assignment.
+    Expects: { assignment_id: <int> }
+    """
+    try:
+        user_id = flask_session.get('user_id')
+        if not user_id:
+            emit('join_ack', {'success': False, 'error': 'Not authenticated'})
+            return
+
+        assignment_id = data.get('assignment_id')
+        if not assignment_id:
+            emit('join_ack', {'success': False, 'error': 'Missing assignment_id'})
+            return
+
+        assignment = Assignment.query.get(int(assignment_id))
+        if not assignment:
+            emit('join_ack', {'success': False, 'error': 'Assignment not found'})
+            return
+
+        # Validate user is part of assignment
+        if assignment.gifter_user_id != user_id and assignment.giftee_user_id != user_id:
+            emit('join_ack', {'success': False, 'error': 'Not part of this assignment'})
+            return
+
+        room = f'chat_{assignment.id}'
+        join_room(room)
+        emit('join_ack', {'success': True, 'room': room})
+        current_app.logger.info(f'User {user_id} joined room {room}')
+    except Exception as e:
+        current_app.logger.exception('Error in join_chat')
+        emit('join_ack', {'success': False, 'error': str(e)})
+
+@socketio.on('typing')
+def handle_typing(data):
+    """
+    Typing indicator.
+    Expects: { typing: True/False, assignment_id: <id> }
+    """
+    try:
+        user_id = flask_session.get('user_id')
+        if not user_id:
+            return
+        assignment_id = data.get('assignment_id')
+        typing = data.get('typing', False)
+        if not assignment_id:
+            return
+        room = f'chat_{int(assignment_id)}'
+        emit('user_typing', {'typing': typing}, room=room, include_self=False)
+    except Exception:
+        current_app.logger.exception('Error in typing handler')
+
+@socketio.on('send_message')
+def handle_message(data):
+    """
+    Expects: { message: "...", assignment_id: <id> }
+    Stores message into both role-specific chat tables (so each participant views messages
+    under their own 'context' table).
+    """
+    try:
+        user_id = flask_session.get('user_id')
+        if not user_id:
+            emit('error_message', {'error': 'Not authenticated'})
+            return
+
+        message_text = (data.get('message') or '').strip()
+        assignment_id = data.get('assignment_id')
+        if not message_text:
+            return
+        if not assignment_id:
+            emit('error_message', {'error': 'Missing assignment_id'})
+            return
+
+        assignment = Assignment.query.get(int(assignment_id))
+        if not assignment:
+            emit('error_message', {'error': 'Assignment not found'})
+            return
+        if not assignment.reveal_completed:
+            emit('error_message', {'error': 'Reveal not completed yet'})
+            return
+
+        # Determine sender_type
+        if assignment.gifter_user_id == user_id:
+            sender_type = 'gifter'
+        elif assignment.giftee_user_id == user_id:
+            sender_type = 'giftee'
+        else:
+            emit('error_message', {'error': 'Not participant of this assignment'})
+            return
+
+        # Persist to the legacy single table for backward compatibility if desired
+        # (optional) - keep existing table behavior
+        message = ChatMessage(
+            assignment_id=assignment.id,
+            sender_type=sender_type,
+            message_text=message_text
+        )
+        db.session.add(message)
+
+        # Persist to role-specific tables:
+        gm = ChatMessageGifter(
+            assignment_id=assignment.id,
+            sender_type=sender_type,
+            message_text=message_text
+        )
+        qm = ChatMessageGiftee(
+            assignment_id=assignment.id,
+            sender_type=sender_type,
+            message_text=message_text
+        )
+        db.session.add(gm)
+        db.session.add(qm)
+
+        db.session.commit()
+
+        payload = {
+            'id': message.id,
+            'sender_type': message.sender_type,
+            'message_text': message.message_text,
+            'timestamp': message.timestamp.isoformat()
+        }
+
+        room = f'chat_{assignment.id}'
+        emit('new_message', payload, room=room)
+
+        # Send email notification to the other party (best-effort)
+        try:
+            if sender_type == 'gifter':
+                EmailService.send_new_message_notification(assignment.giftee, True)
+            else:
+                EmailService.send_new_message_notification(assignment.gifter, False)
+        except Exception:
+            current_app.logger.exception('Failed to send notification email')
+    except Exception:
+        current_app.logger.exception('Error in send_message handler')
+        emit('error_message', {'error': 'Server error while sending message'})
+
+@socketio.on('giftee_send_message')
+def handle_giftee_message(data):
+    # Backwards compatibility: reuse send_message handler
+    handle_message(data)
+
+# ==================== ERROR HANDLERS ====================
+@app.errorhandler(404)
+def not_found(error):
+    return render_template('errors/404.html'), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    return render_template('errors/500.html'), 500
+
+# ==================== RUN APPLICATION ====================
+if __name__ == '__main__':
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\config.py =====
+
+# config.py
+import os
+from datetime import timedelta
+
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-secret-key-change-in-production'
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///database.db'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    
+    # Session configuration
+    PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = 'Lax'
+    
+    # Rate limiting
+    RATELIMIT_STORAGE_URL = 'memory://'
+    
+    # File upload
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max file size
+    
+    # Application settings
+    GIFT_BUDGET = 1500
+    COMPANY_DOMAIN = None  # Set to restrict emails, e.g., '@company.com'
+    
+    # SocketIO
+    SOCKETIO_ASYNC_MODE = 'threading'
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\del_db.py =====
+
+# reset_db.py
+import os
+from app import app, db
+from models import Admin
+
+def reset_database():
+    """Complete database reset"""
+    with app.app_context():
+        # Drop all tables
+        db.drop_all()
+        print("✓ All tables dropped")
+        
+        # Recreate all tables
+        db.create_all()
+        print("✓ All tables recreated")
+        
+        print("\n✅ Database reset complete!")
+        print("⚠️  Note: You'll need to create a new admin account")
+
+if __name__ == '__main__':
+    confirm = input("⚠️  WARNING: This will delete ALL data. Type 'YES' to confirm: ")
+    if confirm == 'YES':
+        reset_database()
+    else:
+        print("Reset cancelled")
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\models.py =====
+
+# models.py
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
+from cryptography.fernet import Fernet
+import json
+
+db = SQLAlchemy()
+
+class SystemSettings(db.Model):
+    __tablename__ = 'system_settings'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    phase = db.Column(db.Integer, default=1)  # 1 or 2
+    smtp_host = db.Column(db.String(255))
+    smtp_port = db.Column(db.Integer, default=587)
+    smtp_user = db.Column(db.String(255))
+    smtp_password_encrypted = db.Column(db.Text)
+    smtp_use_tls = db.Column(db.Boolean, default=True)
+    encryption_key = db.Column(db.Text)
+    assignments_generated = db.Column(db.Boolean, default=False)
+    registration_open = db.Column(db.Boolean, default=True)
+    chat_enabled = db.Column(db.Boolean, default=True)
+    admin_can_view_chats = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def set_smtp_password(self, password):
+        if not self.encryption_key:
+            self.encryption_key = Fernet.generate_key().decode()
+        f = Fernet(self.encryption_key.encode())
+        self.smtp_password_encrypted = f.encrypt(password.encode()).decode()
+    
+    def get_smtp_password(self):
+        if not self.smtp_password_encrypted or not self.encryption_key:
+            return None
+        f = Fernet(self.encryption_key.encode())
+        return f.decrypt(self.smtp_password_encrypted.encode()).decode()
+
+
+class Admin(UserMixin, db.Model):
+    __tablename__ = 'admin'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class User(db.Model):
+    __tablename__ = 'users'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    emp_id = db.Column(db.String(50), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    address = db.Column(db.Text)
+    preferences = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    
+    # Relationships
+    as_gifter = db.relationship('Assignment', foreign_keys='Assignment.gifter_user_id', backref='gifter', lazy=True)
+    as_giftee = db.relationship('Assignment', foreign_keys='Assignment.giftee_user_id', backref='giftee', lazy=True)
+
+
+class Assignment(db.Model):
+    __tablename__ = 'assignments'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    gifter_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    giftee_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    reveal_completed = db.Column(db.Boolean, default=False)
+    reveal_time = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    messages = db.relationship('ChatMessage', backref='assignment', lazy=True, cascade='all, delete-orphan')
+    
+    __table_args__ = (
+        db.UniqueConstraint('gifter_user_id', 'giftee_user_id', name='unique_assignment'),
+    )
+
+
+class ChatMessage(db.Model):
+    __tablename__ = 'chat_messages'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    assignment_id = db.Column(db.Integer, db.ForeignKey('assignments.id'), nullable=False)
+    sender_type = db.Column(db.String(20), nullable=False)  # 'gifter' or 'giftee'
+    message_text = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    read = db.Column(db.Boolean, default=False)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sender_type': self.sender_type,
+            'message_text': self.message_text,
+            'timestamp': self.timestamp.isoformat(),
+            'read': self.read
+        }
+
+
+class LoginAttempt(db.Model):
+    __tablename__ = 'login_attempts'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    ip_address = db.Column(db.String(50), nullable=False)
+    email = db.Column(db.String(120))
+    success = db.Column(db.Boolean, default=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+class ChatMessageGifter(db.Model):
+    __tablename__ = 'chat_messages_gifter'
+    id = db.Column(db.Integer, primary_key=True)
+    assignment_id = db.Column(db.Integer, db.ForeignKey('assignments.id'), nullable=False)
+    sender_type = db.Column(db.String(20), nullable=False)  # 'gifter' or 'giftee'
+    message_text = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    read = db.Column(db.Boolean, default=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sender_type': self.sender_type,
+            'message_text': self.message_text,
+            'timestamp': self.timestamp.isoformat(),
+            'read': self.read
+        }
+
+class ChatMessageGiftee(db.Model):
+    __tablename__ = 'chat_messages_giftee'
+    id = db.Column(db.Integer, primary_key=True)
+    assignment_id = db.Column(db.Integer, db.ForeignKey('assignments.id'), nullable=False)
+    sender_type = db.Column(db.String(20), nullable=False)  # 'gifter' or 'giftee'
+    message_text = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    read = db.Column(db.Boolean, default=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sender_type': self.sender_type,
+            'message_text': self.message_text,
+            'timestamp': self.timestamp.isoformat(),
+            'read': self.read
+        }
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\static\js\chat.js =====
+
+// static/js/chat.js
+document.addEventListener('DOMContentLoaded', function() {
+    // Ensure assignmentId is available from the template:
+    // In the template: <script> const assignmentId = "{{ assignment.id }}"; </script>
+    const socket = io();
+
+    const chatForm = document.getElementById('chatForm');
+    const messageInput = document.getElementById('messageInput');
+    const chatMessages = document.getElementById('chatMessages');
+
+    let connected = false;
+    let joinedRoom = null;
+
+    // Utility: add a message to chat UI
+    function addMessageToChat(data, { optimistic = false } = {}) {
+        if (!chatMessages) return;
+
+        const messageDiv = document.createElement('div');
+        messageDiv.className = `message ${data.sender_type === 'gifter' ? 'message-sent' : 'message-received'}`;
+
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'message-content';
+
+        const textP = document.createElement('p');
+        textP.textContent = data.message_text;
+
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'message-time';
+        try {
+            timeSpan.textContent = formatTime(data.timestamp || new Date().toISOString());
+        } catch (e) {
+            timeSpan.textContent = '';
+        }
+
+        contentDiv.appendChild(textP);
+        contentDiv.appendChild(timeSpan);
+
+        // If optimistic, add a subtle opacity and remove when actual server message arrives
+        if (optimistic) {
+            messageDiv.style.opacity = '0.6';
+            messageDiv.dataset.optimistic = 'true';
+        }
+
+        messageDiv.appendChild(contentDiv);
+        chatMessages.appendChild(messageDiv);
+    }
+
+    // Format timestamp nicely
+    function formatTime(timestamp) {
+        const date = new Date(timestamp);
+        return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    }
+
+    function scrollToBottom() {
+        if (!chatMessages) return;
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    function playNotificationSound() {
+        try {
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            oscillator.frequency.value = 800;
+            oscillator.type = 'sine';
+
+            gainNode.gain.setValueAtTime(0.25, audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.45);
+
+            oscillator.start(audioContext.currentTime);
+            oscillator.stop(audioContext.currentTime + 0.45);
+        } catch (e) {
+            // Ignore audio errors silently
+            console.warn('Notification sound failed', e);
+        }
+    }
+
+    // Socket connection handling
+    socket.on('connect', function() {
+        console.log('[socket] connected');
+        connected = true;
+
+        // Try to join the assignment room explicitly.
+        // assignmentId should be injected by the template where chat page is rendered.
+        if (typeof assignmentId !== 'undefined' && assignmentId) {
+            socket.emit('join_chat', { assignment_id: assignmentId });
+        } else {
+            console.warn('assignmentId is not defined on the page');
+        }
+    });
+
+    socket.on('connect_error', function(err) {
+        console.error('[socket] connect_error', err);
+    });
+
+    socket.on('disconnect', function(reason) {
+        console.log('[socket] disconnected', reason);
+        connected = false;
+        joinedRoom = null;
+    });
+
+    socket.on('join_ack', function(data) {
+        if (data && data.success) {
+            console.log('[socket] join_ack success', data.room);
+            joinedRoom = data.room;
+        } else {
+            console.warn('[socket] join_ack failed', data && data.error);
+        }
+    });
+
+    socket.on('error_message', function(data) {
+        console.error('[socket] error_message', data);
+        // Optionally show a flash notification in UI
+        if (data && data.error) {
+            showNotification(data.error, 'error');
+        }
+    });
+
+    // Server sent new message (broadcast to room)
+    socket.on('new_message', function(data) {
+        // If an optimistic message exists at the bottom, remove it when we get confirmed server message
+        // Simple heuristic: if last message is optimistic and text equals new message, remove optimistic
+        try {
+            const lastChild = chatMessages && chatMessages.lastElementChild;
+            if (lastChild && lastChild.dataset && lastChild.dataset.optimistic === 'true') {
+                const lastText = lastChild.querySelector('.message-content p')?.textContent;
+                if (lastText && lastText.trim() === data.message_text.trim()) {
+                    lastChild.remove();
+                }
+            }
+        } catch (e) {
+            // ignore matching errors
+        }
+
+        addMessageToChat(data);
+        scrollToBottom();
+        playNotificationSound();
+    });
+
+    // Typing indicator events from server (optional)
+    socket.on('user_typing', function(data) {
+        if (!data) return;
+        if (data.typing) showTypingIndicator();
+        else hideTypingIndicator();
+    });
+
+    // Form submit - send message
+    if (chatForm) {
+        chatForm.addEventListener('submit', function(e) {
+            e.preventDefault();
+            const message = messageInput.value ? messageInput.value.trim() : '';
+
+            if (!message) return;
+            if (!connected) {
+                showNotification('Not connected to chat server', 'warning');
+                return;
+            }
+            if (!assignmentId) {
+                showNotification('Missing assignment context', 'error');
+                return;
+            }
+
+            // Optimistic UI
+            const senderType = (chatMode === 'gifter') ? 'gifter' : 'giftee';
+
+
+            scrollToBottom();
+
+            // Emit to server with assignment_id
+            socket.emit('send_message', { message: message, assignment_id: assignmentId });
+
+            // Clear input
+            messageInput.value = '';
+            messageInput.focus();
+        });
+    }
+
+    // Enter to send, Shift+Enter new line
+    if (messageInput) {
+        messageInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (chatForm) chatForm.dispatchEvent(new Event('submit', { cancelable: true }));
+            }
+        });
+
+        // Typing indicator: emit typing start/stop
+        let typingTimeout;
+        messageInput.addEventListener('input', function() {
+            if (!connected) return;
+            socket.emit('typing', { typing: true, assignment_id: assignmentId });
+            clearTimeout(typingTimeout);
+            typingTimeout = setTimeout(() => {
+                socket.emit('typing', { typing: false, assignment_id: assignmentId });
+            }, 900);
+        });
+    }
+
+    // Typing indicator helpers
+    function showTypingIndicator() {
+        if (!chatMessages) return;
+        let indicator = document.getElementById('typingIndicator');
+        if (indicator) return;
+        indicator = document.createElement('div');
+        indicator.id = 'typingIndicator';
+        indicator.className = 'typing-indicator';
+        indicator.innerHTML = `
+            <div class="message message-received">
+                <div class="message-content">
+                    <div class="typing-dots">
+                        <span></span><span></span><span></span>
+                    </div>
+                </div>
+            </div>
+        `;
+        chatMessages.appendChild(indicator);
+        scrollToBottom();
+    }
+
+    function hideTypingIndicator() {
+        const indicator = document.getElementById('typingIndicator');
+        if (indicator) indicator.remove();
+    }
+
+    // Small in-page notification (reuses main.js showNotification if present)
+    function showNotification(msg, type = 'info') {
+        if (typeof window.showNotification === 'function') {
+            window.showNotification(msg, type);
+            return;
+        }
+        // fallback simple alert
+        console.log('[notification]', type, msg);
+    }
+
+    // Initial scroll to bottom
+    setTimeout(scrollToBottom, 100);
+});
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\static\js\main.js =====
+
+// static/js/main.js
+
+// Close flash messages
+document.addEventListener('DOMContentLoaded', function() {
+    const closeButtons = document.querySelectorAll('.close-alert');
+    
+    closeButtons.forEach(button => {
+        button.addEventListener('click', function() {
+            this.parentElement.style.animation = 'slideOut 0.3s ease';
+            setTimeout(() => {
+                this.parentElement.remove();
+            }, 300);
+        });
+    });
+    
+    // Auto-close flash messages after 5 seconds
+    const alerts = document.querySelectorAll('.alert');
+    alerts.forEach(alert => {
+        setTimeout(() => {
+            alert.style.animation = 'slideOut 0.3s ease';
+            setTimeout(() => {
+                alert.remove();
+            }, 300);
+        }, 5000);
+    });
+});
+
+// Add slideOut animation
+const style = document.createElement('style');
+style.textContent = `
+    @keyframes slideOut {
+        from {
+            transform: translateX(0);
+            opacity: 1;
+        }
+        to {
+            transform: translateX(400px);
+            opacity: 0;
+        }
+    }
+`;
+document.head.appendChild(style);
+
+// Form validation helper
+function validateForm(formId) {
+    const form = document.getElementById(formId);
+    if (!form) return true;
+    
+    const inputs = form.querySelectorAll('input[required], textarea[required], select[required]');
+    let isValid = true;
+    
+    inputs.forEach(input => {
+        if (!input.value.trim()) {
+            isValid = false;
+            input.classList.add('error');
+            showFieldError(input, 'This field is required');
+        } else {
+            input.classList.remove('error');
+            hideFieldError(input);
+        }
+    });
+    
+    return isValid;
+}
+
+function showFieldError(input, message) {
+    // Remove existing error message
+    hideFieldError(input);
+    
+    const errorDiv = document.createElement('div');
+    errorDiv.className = 'field-error';
+    errorDiv.textContent = message;
+    errorDiv.style.color = 'var(--danger-color)';
+    errorDiv.style.fontSize = '0.875rem';
+    errorDiv.style.marginTop = '0.25rem';
+    
+    input.parentElement.appendChild(errorDiv);
+}
+
+function hideFieldError(input) {
+    const existingError = input.parentElement.querySelector('.field-error');
+    if (existingError) {
+        existingError.remove();
+    }
+}
+
+// Email validation
+function validateEmail(email) {
+    const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return re.test(email);
+}
+
+// Password strength checker
+function checkPasswordStrength(password) {
+    let strength = 0;
+    
+    if (password.length >= 8) strength++;
+    if (password.length >= 12) strength++;
+    if (/[a-z]/.test(password)) strength++;
+    if (/[A-Z]/.test(password)) strength++;
+    if (/[0-9]/.test(password)) strength++;
+    if (/[^A-Za-z0-9]/.test(password)) strength++;
+    
+    return strength;
+}
+
+// Debounce function for search/filter
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+// Copy to clipboard
+function copyToClipboard(text) {
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(() => {
+            showNotification('Copied to clipboard!', 'success');
+        }).catch(err => {
+            console.error('Failed to copy:', err);
+        });
+    } else {
+        // Fallback for older browsers
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.select();
+        try {
+            document.execCommand('copy');
+            showNotification('Copied to clipboard!', 'success');
+        } catch (err) {
+            console.error('Failed to copy:', err);
+        }
+        document.body.removeChild(textArea);
+    }
+}
+
+// Show notification
+function showNotification(message, type = 'info') {
+    const notification = document.createElement('div');
+    notification.className = `alert alert-${type}`;
+    notification.innerHTML = `
+        ${message}
+        <button class="close-alert">&times;</button>
+    `;
+    
+    const container = document.querySelector('.flash-messages') || createFlashContainer();
+    container.appendChild(notification);
+    
+    // Add close functionality
+    notification.querySelector('.close-alert').addEventListener('click', () => {
+        notification.style.animation = 'slideOut 0.3s ease';
+        setTimeout(() => notification.remove(), 300);
+    });
+    
+    // Auto-remove after 5 seconds
+    setTimeout(() => {
+        notification.style.animation = 'slideOut 0.3s ease';
+        setTimeout(() => notification.remove(), 300);
+    }, 5000);
+}
+
+function createFlashContainer() {
+    const container = document.createElement('div');
+    container.className = 'flash-messages';
+    document.body.appendChild(container);
+    return container;
+}
+
+// Confirm dialog
+function confirmAction(message, callback) {
+    if (confirm(message)) {
+        callback();
+    }
+}
+
+// Loading overlay
+function showLoading() {
+    const overlay = document.createElement('div');
+    overlay.id = 'loadingOverlay';
+    overlay.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.5);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+    `;
+    overlay.innerHTML = '<div class="spinner"></div>';
+    document.body.appendChild(overlay);
+}
+
+function hideLoading() {
+    const overlay = document.getElementById('loadingOverlay');
+    if (overlay) {
+        overlay.remove();
+    }
+}
+
+// Table search/filter
+function filterTable(inputId, tableId) {
+    const input = document.getElementById(inputId);
+    const table = document.getElementById(tableId);
+    
+    if (!input || !table) return;
+    
+    input.addEventListener('input', debounce(function() {
+        const filter = this.value.toLowerCase();
+        const rows = table.querySelectorAll('tbody tr');
+        
+        rows.forEach(row => {
+            const text = row.textContent.toLowerCase();
+            row.style.display = text.includes(filter) ? '' : 'none';
+        });
+    }, 300));
+}
+
+// Smooth scroll to element
+function smoothScrollTo(elementId) {
+    const element = document.getElementById(elementId);
+    if (element) {
+        element.scrollIntoView({
+            behavior: 'smooth',
+            block: 'start'
+        });
+    }
+}
+
+// Format date
+function formatDate(dateString) {
+    const date = new Date(dateString);
+    return date.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+}
+
+// Export data as CSV
+function exportTableToCSV(tableId, filename) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    
+    const rows = Array.from(table.querySelectorAll('tr'));
+    const csv = rows.map(row => {
+        const cells = Array.from(row.querySelectorAll('th, td'));
+        return cells.map(cell => {
+            let text = cell.textContent.trim();
+            // Escape quotes and wrap in quotes if contains comma
+            if (text.includes(',') || text.includes('"')) {
+                text = '"' + text.replace(/"/g, '""') + '"';
+            }
+            return text;
+        }).join(',');
+    }).join('\n');
+    
+    downloadCSV(csv, filename);
+}
+
+function downloadCSV(csv, filename) {
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+}
+
+// Responsive navbar toggle for mobile
+function initMobileNav() {
+    const navbar = document.querySelector('.navbar');
+    if (!navbar) return;
+    
+    // Create mobile menu button if needed
+    const navLinks = navbar.querySelector('.nav-links');
+    if (window.innerWidth <= 768 && navLinks) {
+        const menuBtn = document.createElement('button');
+        menuBtn.className = 'mobile-menu-btn';
+        menuBtn.innerHTML = '☰';
+        menuBtn.style.cssText = `
+            display: none;
+            background: none;
+            border: none;
+            color: white;
+            font-size: 1.5rem;
+            cursor: pointer;
+        `;
+        
+        navbar.querySelector('.container').insertBefore(menuBtn, navLinks);
+        
+        menuBtn.addEventListener('click', () => {
+            navLinks.classList.toggle('show');
+        });
+    }
+}
+
+// Initialize on page load
+document.addEventListener('DOMContentLoaded', () => {
+    initMobileNav();
+});
+
+// Handle window resize
+window.addEventListener('resize', debounce(() => {
+    initMobileNav();
+}, 250));
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\static\js\scratch-card.js =====
+
+// static/js/scratch-card.js
+
+document.addEventListener('DOMContentLoaded', function() {
+    const cards = document.querySelectorAll('.scratch-card');
+    let cardRevealed = false;
+    
+    cards.forEach(card => {
+        initScratchCard(card);
+    });
+    
+    function initScratchCard(canvas) {
+        const ctx = canvas.getContext('2d');
+        const wrapper = canvas.parentElement;
+        
+        // Set canvas size
+        canvas.width = wrapper.offsetWidth;
+        canvas.height = wrapper.offsetHeight;
+        
+        // Draw scratch surface
+        drawScratchSurface(ctx, canvas.width, canvas.height);
+        
+        let isScratching = false;
+        let scratchedArea = 0;
+        
+        // Mouse events
+        canvas.addEventListener('mousedown', startScratching);
+        canvas.addEventListener('mousemove', scratch);
+        canvas.addEventListener('mouseup', stopScratching);
+        canvas.addEventListener('mouseleave', stopScratching);
+        
+        // Touch events
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            startScratching(e);
+        });
+        canvas.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            scratch(e);
+        });
+        canvas.addEventListener('touchend', stopScratching);
+        
+        function startScratching(e) {
+            if (cardRevealed) return;
+            isScratching = true;
+            canvas.style.cursor = 'crosshair';
+        }
+        
+        function stopScratching() {
+            isScratching = false;
+            canvas.style.cursor = 'pointer';
+        }
+        
+        function scratch(e) {
+            if (!isScratching || cardRevealed) return;
+            
+            const rect = canvas.getBoundingClientRect();
+            let x, y;
+            
+            if (e.type.includes('touch')) {
+                x = e.touches[0].clientX - rect.left;
+                y = e.touches[0].clientY - rect.top;
+            } else {
+                x = e.clientX - rect.left;
+                y = e.clientY - rect.top;
+            }
+            
+            // Scale coordinates for canvas resolution
+            x = x * (canvas.width / rect.width);
+            y = y * (canvas.height / rect.height);
+            
+            // Create scratch effect
+            ctx.globalCompositeOperation = 'destination-out';
+            ctx.beginPath();
+            ctx.arc(x, y, 30, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Check scratched percentage
+            scratchedArea = calculateScratchedArea(ctx, canvas.width, canvas.height);
+            
+            if (scratchedArea > 30 && !cardRevealed) {
+                revealCard();
+            }
+        }
+    }
+    
+    function drawScratchSurface(ctx, width, height) {
+        // Draw gradient background
+        const gradient = ctx.createLinearGradient(0, 0, width, height);
+        gradient.addColorStop(0, '#667eea');
+        gradient.addColorStop(1, '#764ba2');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, width, height);
+        
+        // Add pattern
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+        for (let i = 0; i < width; i += 20) {
+            for (let j = 0; j < height; j += 20) {
+                if ((i + j) % 40 === 0) {
+                    ctx.fillRect(i, j, 10, 10);
+                }
+            }
+        }
+        
+        // Add text
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+        ctx.font = 'bold 24px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('Scratch Here!', width / 2, height / 2);
+        
+        // Add decorative elements
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.font = '60px Arial';
+        ctx.fillText('🎁', width / 2 - 40, height / 2 - 60);
+        ctx.fillText('🎄', width / 2 + 40, height / 2 - 60);
+    }
+    
+    function calculateScratchedArea(ctx, width, height) {
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const pixels = imageData.data;
+        let transparent = 0;
+        
+        for (let i = 3; i < pixels.length; i += 4) {
+            if (pixels[i] === 0) {
+                transparent++;
+            }
+        }
+        
+        return (transparent / (pixels.length / 4)) * 100;
+    }
+    
+    function revealCard() {
+        if (cardRevealed) return;
+        cardRevealed = true;
+        
+        // Animate all cards away
+        const cards = document.querySelectorAll('.scratch-card');
+        cards.forEach((card, index) => {
+            setTimeout(() => {
+                card.style.transition = 'all 0.5s ease';
+                card.style.opacity = '0';
+                card.style.transform = 'scale(0)';
+            }, index * 100);
+        });
+        
+        // Show result modal after animation
+        setTimeout(() => {
+            showResultModal();
+            completeReveal();
+        }, 1000);
+    }
+    
+    function showResultModal() {
+        const modal = document.getElementById('resultModal');
+        if (modal) {
+            modal.classList.add('show');
+            createConfetti();
+        }
+    }
+    
+    function completeReveal() {
+        // Call backend to mark reveal as complete
+        fetch('/api/complete-reveal', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        }).then(response => response.json())
+          .then(data => {
+              if (data.success) {
+                  console.log('Reveal completed successfully');
+              }
+          }).catch(error => {
+              console.error('Error completing reveal:', error);
+          });
+    }
+    
+    function createConfetti() {
+        const colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe'];
+        const confettiCount = 100;
+        
+        for (let i = 0; i < confettiCount; i++) {
+            setTimeout(() => {
+                const confetti = document.createElement('div');
+                confetti.className = 'confetti';
+                confetti.style.left = Math.random() * 100 + '%';
+                confetti.style.background = colors[Math.floor(Math.random() * colors.length)];
+                confetti.style.animationDelay = Math.random() * 3 + 's';
+                confetti.style.animationDuration = (Math.random() * 2 + 3) + 's';
+                document.body.appendChild(confetti);
+                
+                setTimeout(() => confetti.remove(), 6000);
+            }, i * 30);
+        }
+    }
+});
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\static\js\spin-wheel.js =====
+
+// static/js/spin-wheel.js
+document.addEventListener('DOMContentLoaded', function() {
+    const canvas = document.getElementById('wheelCanvas');
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    const spinButton = document.getElementById('spinButton');
+
+    // Wheel configuration
+    const segments = 8;
+    const segmentAngle = (Math.PI * 2) / segments;
+    const colors = [
+        '#667eea', '#764ba2', '#f093fb', '#f5576c',
+        '#4facfe', '#00f2fe', '#43e97b', '#38f9d7'
+    ];
+
+    let currentAngle = 0;
+    let spinning = false;
+    let spinAngleStart = 0;
+    let spinTime = 0;
+    let spinTimeTotal = 0;
+
+    drawWheel(); // initial draw with placeholders
+    createPointer();
+
+    spinButton.addEventListener('click', function() {
+        if (!spinning) {
+            spin();
+        }
+    });
+
+    function drawWheel() {
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
+        const radius = Math.min(centerX, centerY) - 10;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        for (let i = 0; i < segments; i++) {
+            const angle = i * segmentAngle;
+            ctx.beginPath();
+            ctx.moveTo(centerX, centerY);
+            ctx.arc(centerX, centerY, radius, angle, angle + segmentAngle);
+            ctx.closePath();
+            ctx.fillStyle = colors[i % colors.length];
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            // Draw placeholder text (hidden style)
+            ctx.save();
+            ctx.translate(centerX, centerY);
+            ctx.rotate(angle + segmentAngle / 2);
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(255,255,255,0.9)';
+            ctx.font = 'bold 18px Arial';
+            // Show placeholder (e.g. "???") while spinning/not revealed
+            ctx.fillText('???', radius / 2, 10);
+            ctx.restore();
+        }
+
+        // center circle
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, 30, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff';
+        ctx.fill();
+        ctx.strokeStyle = '#667eea';
+        ctx.lineWidth = 5;
+        ctx.stroke();
+    }
+
+    function createPointer() {
+        const container = canvas.parentElement;
+        const pointer = document.createElement('div');
+        pointer.className = 'wheel-pointer';
+        pointer.style.position = 'absolute';
+        pointer.style.top = '0';
+        pointer.style.left = '50%';
+        pointer.style.transform = 'translateX(-50%)';
+        pointer.style.width = '0';
+        pointer.style.height = '0';
+        pointer.style.borderLeft = '20px solid transparent';
+        pointer.style.borderRight = '20px solid transparent';
+        pointer.style.borderTop = '40px solid #ef4444';
+        pointer.style.filter = 'drop-shadow(0 5px 10px rgba(0, 0, 0, 0.3))';
+        pointer.style.zIndex = '10';
+
+        container.style.position = 'relative';
+        container.insertBefore(pointer, canvas);
+    }
+
+    function spin() {
+        spinning = true;
+        spinButton.disabled = true;
+        spinButton.textContent = 'Spinning...';
+
+        spinTimeTotal = Math.random() * 2000 + 3000; // 3-5s
+        spinAngleStart = Math.random() * 10 + 10; // initial speed in degrees
+        spinTime = 0;
+
+        requestAnimationFrame(rotateWheel);
+    }
+
+    function rotateWheel(timestamp) {
+        // Use a simple time-step approach
+        spinTime += 30;
+
+        if (spinTime >= spinTimeTotal) {
+            stopRotateWheel();
+            return;
+        }
+
+        const spinAngle = spinAngleStart - easeOut(spinTime, 0, spinAngleStart, spinTimeTotal);
+        currentAngle += (spinAngle * Math.PI) / 180;
+
+        // draw rotated wheel
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(currentAngle);
+        ctx.translate(-canvas.width / 2, -canvas.height / 2);
+        drawWheel(); // draw placeholders (rotated)
+        ctx.restore();
+
+        requestAnimationFrame(rotateWheel);
+    }
+
+    function stopRotateWheel() {
+        spinning = false;
+
+        // small bounce effect then reveal
+        let bounces = 6;
+        let bounceAngle = 0.15;
+
+        function bounce() {
+            if (bounces <= 0) {
+                revealWinner();
+                return;
+            }
+
+            currentAngle += bounceAngle;
+            bounceAngle *= -0.5;
+            bounces--;
+
+            ctx.save();
+            ctx.translate(canvas.width / 2, canvas.height / 2);
+            ctx.rotate(currentAngle);
+            ctx.translate(-canvas.width / 2, -canvas.height / 2);
+            drawWheel();
+            ctx.restore();
+
+            setTimeout(bounce, 80);
+        }
+
+        bounce();
+    }
+
+    function easeOut(t, b, c, d) {
+        const ts = (t /= d) * t;
+        const tc = ts * t;
+        return b + c * (tc + -3 * ts + 3 * t);
+    }
+
+    function revealWinner() {
+        // compute selected segment
+        // wheel rotation: currentAngle radians, pointer at top (angle 0). Convert to segment index.
+        const normalizedAngle = (currentAngle % (Math.PI * 2) + (Math.PI * 2)) % (Math.PI * 2);
+        // pointer points to top (angle = 0). The segment at (2π - normalizedAngle) is at pointer.
+        const pointerAngle = (Math.PI * 2 - normalizedAngle + (segmentAngle / 2));
+        const selectedIndex = Math.floor(pointerAngle / segmentAngle) % segments;
+
+        // redraw wheel and draw actual name on selected segment
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(currentAngle);
+        ctx.translate(-canvas.width / 2, -canvas.height / 2);
+        drawWheel(); // placeholders
+        // draw name on selected segment
+        drawNameOnSegment(selectedIndex, gifteeName);
+        ctx.restore();
+
+        // show result modal and mark reveal
+        const modal = document.getElementById('resultModal');
+        if (modal) {
+            // set the name in modal
+            const el = modal.querySelector('#gifteeName');
+            if (el) el.textContent = gifteeName;
+            modal.classList.add('show');
+            createConfetti();
+            completeReveal();
+        }
+
+        spinButton.disabled = false;
+        spinButton.textContent = '🎲 SPIN THE WHEEL';
+    }
+
+    function drawNameOnSegment(index, name) {
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
+        const radius = Math.min(centerX, centerY) - 10;
+        const angle = index * segmentAngle;
+
+        // draw text rotated to segment center (but inverse rotate so it appears upright)
+        ctx.save();
+        ctx.translate(centerX, centerY);
+        ctx.rotate(angle + segmentAngle / 2);
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 20px Arial';
+        // draw name slightly closer to edge
+        ctx.fillText(name, radius / 2, 10);
+        ctx.restore();
+    }
+
+    function completeReveal() {
+        // Call backend to mark reveal as complete
+        fetch('/api/complete-reveal', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        }).then(response => response.json())
+          .then(data => {
+              if (data.success) {
+                  console.log('Reveal completed successfully');
+              }
+          }).catch(error => {
+              console.error('Error completing reveal:', error);
+          });
+    }
+
+    function createConfetti() {
+        const colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe'];
+        const confettiCount = 80;
+
+        for (let i = 0; i < confettiCount; i++) {
+            setTimeout(() => {
+                const confetti = document.createElement('div');
+                confetti.className = 'confetti';
+                confetti.style.left = Math.random() * 100 + '%';
+                confetti.style.background = colors[Math.floor(Math.random() * colors.length)];
+                confetti.style.animationDelay = Math.random() * 3 + 's';
+                confetti.style.animationDuration = (Math.random() * 2 + 3) + 's';
+                document.body.appendChild(confetti);
+
+                setTimeout(() => confetti.remove(), 6000);
+            }, i * 20);
+        }
+    }
+});
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\base.html =====
+
+<!-- templates/base.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Secret Santa{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container">
+            <a href="{{ url_for('index') }}" class="logo">🎅 Secret Santa</a>
+            <ul class="nav-links">
+                {% if session.get('admin_id') %}
+                    <li><a href="{{ url_for('admin_dashboard') }}">Dashboard</a></li>
+                    <li><a href="{{ url_for('admin_participants') }}">Participants</a></li>
+                    <li><a href="{{ url_for('admin_assignments') }}">Assignments</a></li>
+                    <li><a href="{{ url_for('admin_settings') }}">Settings</a></li>
+                    <li><a href="{{ url_for('admin_logout') }}">Logout</a></li>
+                {% elif session.get('user_id') %}
+                    <li><a href="{{ url_for('user_dashboard') }}">Dashboard</a></li>
+                    <li><a href="{{ url_for('chat') }}">Chat</a></li>
+                    <li><a href="{{ url_for('user_logout') }}">Logout</a></li>
+                {% else %}
+                    <li><a href="{{ url_for('index') }}">Home</a></li>
+                    <li><a href="{{ url_for('user_login') }}">Login</a></li>
+                    <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+                {% endif %}
+            </ul>
+        </div>
+    </nav>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            <div class="flash-messages">
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">
+                        {{ message }}
+                        <button class="close-alert">&times;</button>
+                    </div>
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% endwith %}
+
+    <main class="main-content">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2024 Secret Santa. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    {% block extra_js %}{% endblock %}
+</body>
+</html>
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\index.html =====
+
+<!-- templates/index.html -->
+{% extends "base.html" %}
+
+{% block content %}
+<div class="hero">
+    <div class="container">
+        <h1>🎄 Welcome to Secret Santa! 🎁</h1>
+        <p class="subtitle">Spread joy and surprise your colleagues with thoughtful gifts!</p>
+        
+        {% if phase == 1 and registration_open %}
+            <div class="cta-section">
+                <h2>Phase 1: Registration Open!</h2>
+                <p>Sign up now to participate in this year's Secret Santa event</p>
+                <a href="{{ url_for('register') }}" class="btn btn-primary btn-lg">Register Now</a>
+            </div>
+        {% elif phase == 1 and not registration_open %}
+            <div class="info-section">
+                <h2>Registration Closed</h2>
+                <p>Registration has been closed by the admin. Please wait for Phase 2 announcement.</p>
+            </div>
+        {% elif phase == 2 %}
+            <div class="cta-section">
+                <h2>Phase 2: Assignments Ready!</h2>
+                <p>Login to discover your Secret Santa match!</p>
+                <a href="{{ url_for('user_login') }}" class="btn btn-primary btn-lg">Login to Reveal</a>
+            </div>
+        {% endif %}
+        
+        <div class="features">
+            <div class="feature">
+                <div class="feature-icon">📝</div>
+                <h3>Easy Registration</h3>
+                <p>Quick and simple signup process</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">🎲</div>
+                <h3>Random Matching</h3>
+                <p>Fair algorithm ensures everyone gets a match</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">💬</div>
+                <h3>Anonymous Chat</h3>
+                <p>Communicate with your giftee anonymously</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">🎁</div>
+                <h3>Fun Reveal</h3>
+                <p>Exciting animation to reveal your match</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\login.html =====
+
+<!-- templates/login.html -->
+{% extends "base.html" %}
+
+{% block title %}Login - Secret Santa{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="form-container">
+        <h1>🔐 Login to Secret Santa</h1>
+        <p class="form-subtitle">Enter your credentials to see your match</p>
+        
+        <form method="POST" action="{{ url_for('user_login') }}" class="login-form">
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="email" id="email" name="email" required 
+                       placeholder="your.email@company.com">
+            </div>
+            
+            <div class="form-group">
+                <label for="emp_id">Employee ID</label>
+                <input type="text" id="emp_id" name="emp_id" required 
+                       placeholder="Enter your employee ID">
+            </div>
+            
+            <button type="submit" class="btn btn-primary btn-block">Login</button>
+        </form>
+        
+        <div class="form-footer">
+            <p>Not registered yet? Wait for Phase 1 registration period.</p>
+            <p><a href="{{ url_for('index') }}">Back to Home</a></p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\register.html =====
+
+<!-- templates/register.html -->
+{% extends "base.html" %}
+
+{% block title %}Register - Secret Santa{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="form-container">
+        <h1>🎅 Register for Secret Santa</h1>
+        <p class="form-subtitle">Fill in your details to participate in the gift exchange</p>
+        
+        <form method="POST" action="{{ url_for('register') }}" class="registration-form">
+            <div class="form-group">
+                <label for="name">Full Name *</label>
+                <input type="text" id="name" name="name" required 
+                       placeholder="Enter your full name">
+            </div>
+            
+            <div class="form-group">
+                <label for="emp_id">Employee ID *</label>
+                <input type="text" id="emp_id" name="emp_id" required 
+                       placeholder="Enter your employee ID">
+            </div>
+            
+            <div class="form-group">
+                <label for="email">Email Address *</label>
+                <input type="email" id="email" name="email" required 
+                       placeholder="your.email@company.com">
+            </div>
+            
+            <div class="form-group">
+                <label for="preferences">Gift Preferences * (Budget: ₹{{ budget }})</label>
+                <textarea id="preferences" name="preferences" required 
+                          placeholder="Tell us your interests, hobbies, favorite things..." 
+                          rows="5" maxlength="500"></textarea>
+                <small class="form-help">Maximum 500 characters</small>
+            </div>
+            
+            <div class="form-group">
+                <label for="address">Delivery Address (Optional)</label>
+                <textarea id="address" name="address" 
+                          placeholder="Your delivery address if different from office" 
+                          rows="3"></textarea>
+            </div>
+            
+            <button type="submit" class="btn btn-primary btn-block">Complete Registration</button>
+        </form>
+        
+        <div class="form-footer">
+            <p>Already registered? <a href="{{ url_for('user_login') }}">Login here</a></p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\register_success.html =====
+
+<!-- templates/register_success.html -->
+{% extends "base.html" %}
+
+{% block title %}Registration Successful{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="success-container">
+        <div class="success-icon">✅</div>
+        <h1>Registration Successful!</h1>
+        <p class="success-message">Thank you for registering, {{ user.name }}!</p>
+        
+        <div class="info-box">
+            <h3>What's Next?</h3>
+            <ul class="checklist">
+                <li>✉️ Check your email ({{ user.email }}) for confirmation</li>
+                <li>⏰ Wait for Phase 2 announcement</li>
+                <li>🎁 Prepare to discover your Secret Santa match!</li>
+                <li>💬 Use anonymous chat to learn more about your giftee</li>
+            </ul>
+        </div>
+        
+        <div class="your-details">
+            <h3>Your Registration Details</h3>
+            <table class="details-table">
+                <tr>
+                    <td><strong>Name:</strong></td>
+                    <td>{{ user.name }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Employee ID:</strong></td>
+                    <td>{{ user.emp_id }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Email:</strong></td>
+                    <td>{{ user.email }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Preferences:</strong></td>
+                    <td>{{ user.preferences }}</td>
+                </tr>
+            </table>
+        </div>
+        
+        <a href="{{ url_for('index') }}" class="btn btn-primary">Back to Home</a>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\admin\assignments.html =====
+
+<!-- templates/admin/assignments.html -->
+{% extends "base.html" %}
+
+{% block title %}Assignments - Admin{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>🎁 Secret Santa Assignments</h1>
+        <div class="header-actions">
+            {% if not settings.assignments_generated %}
+            <form method="POST" action="{{ url_for('generate_assignments') }}" 
+                  onsubmit="return confirm('Generate new assignments? This will replace any existing assignments.');">
+                <button type="submit" class="btn btn-primary">🎲 Generate Assignments</button>
+            </form>
+            {% else %}
+            <a href="{{ url_for('export_assignments') }}" class="btn btn-secondary">
+                📥 Export CSV
+            </a>
+            {% endif %}
+        </div>
+    </div>
+    
+    {% if assignments %}
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Gifter</th>
+                    <th>Gifter Email</th>
+                    <th>→</th>
+                    <th>Giftee</th>
+                    <th>Giftee Email</th>
+                    <th>Reveal Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for assignment in assignments %}
+                <tr>
+                    <td>{{ assignment.gifter.name }}</td>
+                    <td>{{ assignment.gifter.email }}</td>
+                    <td class="text-center">→</td>
+                    <td>{{ assignment.giftee.name }}</td>
+                    <td>{{ assignment.giftee.email }}</td>
+                    <td>
+                        {% if assignment.reveal_completed %}
+                        <span class="badge badge-success">✅ Revealed</span>
+                        {% else %}
+                        <span class="badge badge-pending">⏳ Pending</span>
+                        {% endif %}
+                    </td>
+                    <td class="actions">
+                        <button class="btn btn-sm btn-secondary"
+                            onclick="openOverrideModal('{{ assignment.id }}')">
+
+                        </button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>No assignments generated yet. Click "Generate Assignments" to create matches.</p>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Override Modal -->
+<div id="overrideModal" class="modal">
+    <div class="modal-content">
+        <span class="close">&times;</span>
+        <h2>Override Assignment</h2>
+        <form id="overrideForm" method="POST">
+            <div class="form-group">
+                <label for="new_giftee_id">Select New Giftee</label>
+                <select id="new_giftee_id" name="new_giftee_id" required>
+                    <option value="">-- Select Giftee --</option>
+                    {% for assignment in assignments %}
+                    <option value="{{ assignment.giftee.id }}">{{ assignment.giftee.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button type="submit" class="btn btn-primary">Save Override</button>
+        </form>
+    </div>
+</div>
+
+<script>
+function openOverrideModal(assignmentId) {
+    const modal = document.getElementById('overrideModal');
+    const form = document.getElementById('overrideForm');
+    form.action = `/admin/assignments/${assignmentId}/override`;
+    modal.style.display = 'block';
+}
+
+document.querySelector('.close').onclick = function() {
+    document.getElementById('overrideModal').style.display = 'none';
+}
+</script>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\admin\chats.html =====
+
+<!-- templates/admin/chats.html -->
+{% extends "base.html" %}
+
+{% block title %}Chat Monitoring - Admin{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>💬 Chat Monitoring</h1>
+        <p class="subtitle">View anonymous conversations between gifters and giftees</p>
+    </div>
+    
+    {% if chat_data %}
+    <div class="chats-list">
+        {% for data in chat_data %}
+        <div class="chat-card">
+            <div class="chat-card-header">
+                <h3>{{ data.gifter.name }} → {{ data.giftee.name }}</h3>
+                <span class="message-count">{{ data.messages|length }} messages</span>
+            </div>
+            <div class="chat-card-body">
+                {% if data.messages %}
+                <div class="messages-preview">
+<!-- templates/admin/chats.html (continued) -->
+                    {% for message in data.messages %}
+                    <div class="message-preview {% if message.sender_type == 'gifter' %}from-gifter{% else %}from-giftee{% endif %}">
+                        <span class="sender-label">
+                            {% if message.sender_type == 'gifter' %}
+                            Gifter ({{ data.gifter.name }})
+                            {% else %}
+                            Giftee ({{ data.giftee.name }})
+                            {% endif %}
+                        </span>
+                        <p>{{ message.message_text }}</p>
+                        <span class="message-timestamp">{{ message.timestamp.strftime('%Y-%m-%d %I:%M %p') }}</span>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <p class="no-messages">No messages yet</p>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>No chats to display. Users haven't revealed their matches yet.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\admin\dashboard.html =====
+
+<!-- templates/admin/dashboard.html -->
+{% extends "base.html" %}
+
+{% block title %}Admin Dashboard - Secret Santa{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="admin-header">
+        <h1>🎅 Admin Dashboard</h1>
+        <div class="phase-indicator">
+            <span class="phase-badge phase-{{ settings.phase }}">
+                Phase {{ settings.phase }}
+            </span>
+        </div>
+    </div>
+    
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-icon">👥</div>
+            <div class="stat-content">
+                <h3>{{ stats.total_participants }}</h3>
+                <p>Total Participants</p>
+            </div>
+        </div>
+        
+        <div class="stat-card">
+            <div class="stat-icon">🎁</div>
+            <div class="stat-content">
+                <h3>{{ stats.reveals_completed }}</h3>
+                <p>Reveals Completed</p>
+            </div>
+        </div>
+        
+        <div class="stat-card">
+            <div class="stat-icon">💬</div>
+            <div class="stat-content">
+                <h3>{{ stats.total_messages }}</h3>
+                <p>Chat Messages</p>
+            </div>
+        </div>
+        
+        <div class="stat-card">
+            <div class="stat-icon">✅</div>
+            <div class="stat-content">
+                <h3>{% if stats.assignments_generated %}Yes{% else %}No{% endif %}</h3>
+                <p>Assignments Generated</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="admin-actions">
+        <h2>Quick Actions</h2>
+        <div class="actions-grid">
+            <a href="{{ url_for('admin_participants') }}" class="action-card">
+                <div class="action-icon">👥</div>
+                <h3>View Participants</h3>
+                <p>Manage registered users</p>
+            </a>
+            
+            <a href="{{ url_for('admin_assignments') }}" class="action-card">
+                <div class="action-icon">🎲</div>
+                <h3>Assignments</h3>
+                <p>Generate and manage matches</p>
+            </a>
+            
+            <a href="{{ url_for('admin_settings') }}" class="action-card">
+                <div class="action-icon">⚙️</div>
+                <h3>Settings</h3>
+                <p>Configure system settings</p>
+            </a>
+            
+            {% if settings.admin_can_view_chats %}
+            <a href="{{ url_for('admin_chats') }}" class="action-card">
+                <div class="action-icon">💬</div>
+                <h3>Monitor Chats</h3>
+                <p>View anonymous conversations</p>
+            </a>
+            {% endif %}
+        </div>
+    </div>
+    
+    <div class="phase-control">
+        <h2>Phase Control</h2>
+        <div class="phase-info">
+            {% if settings.phase == 1 %}
+            <p><strong>Current Phase:</strong> Registration Phase</p>
+            <p>Users can register for Secret Santa. Generate assignments before moving to Phase 2.</p>
+            {% else %}
+            <p><strong>Current Phase:</strong> Assignment & Chat Phase</p>
+            <p>Users can login, reveal their matches, and chat anonymously.</p>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\admin\edit_participant.html =====
+
+<!-- templates/admin/edit_participant.html -->
+{% extends "base.html" %}
+
+{% block title %}Edit Participant - Admin{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>✏️ Edit Participant</h1>
+    </div>
+    
+    <div class="form-container">
+        <form method="POST" action="{{ url_for('edit_participant', user_id=user.id) }}">
+            <div class="form-group">
+                <label for="name">Full Name</label>
+                <input type="text" id="name" name="name" value="{{ user.name }}" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="emp_id">Employee ID</label>
+                <input type="text" id="emp_id" name="emp_id" value="{{ user.emp_id }}" readonly>
+                <small class="form-help">Employee ID cannot be changed</small>
+            </div>
+            
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="email" id="email" name="email" value="{{ user.email }}" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="preferences">Gift Preferences</label>
+                <textarea id="preferences" name="preferences" rows="5" required>{{ user.preferences }}</textarea>
+            </div>
+            
+            <div class="form-group">
+                <label for="address">Delivery Address</label>
+                <textarea id="address" name="address" rows="3">{{ user.address or '' }}</textarea>
+            </div>
+            
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">Save Changes</button>
+                <a href="{{ url_for('admin_participants') }}" class="btn btn-secondary">Cancel</a>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\admin\login.html =====
+
+<!-- templates/admin/login.html -->
+{% extends "base.html" %}
+
+{% block title %}Admin Login - Secret Santa{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="form-container">
+        <h1>🔐 Admin Login</h1>
+        <p class="form-subtitle">Access the admin dashboard</p>
+        
+        <form method="POST" action="{{ url_for('admin_login') }}" class="login-form">
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="email" id="email" name="email" required 
+                       placeholder="admin@company.com">
+            </div>
+            
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required 
+                       placeholder="Enter your password">
+            </div>
+            
+            <button type="submit" class="btn btn-primary btn-block">Login</button>
+        </form>
+        
+        <div class="form-footer">
+            <p><a href="{{ url_for('index') }}">Back to Home</a></p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\admin\participants.html =====
+
+<!-- templates/admin/participants.html -->
+{% extends "base.html" %}
+
+{% block title %}Participants - Admin{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>👥 Participants</h1>
+        <div class="header-actions">
+            <a href="{{ url_for('export_participants') }}" class="btn btn-secondary">
+                📥 Export CSV
+            </a>
+        </div>
+    </div>
+    
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Employee ID</th>
+                    <th>Email</th>
+                    <th>Preferences</th>
+                    <th>Registered On</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for participant in participants %}
+                <tr>
+                    <td>{{ participant.name }}</td>
+                    <td>{{ participant.emp_id }}</td>
+                    <td>{{ participant.email }}</td>
+                    <td>
+                        <div class="truncate" title="{{ participant.preferences }}">
+                            {{ participant.preferences }}
+                        </div>
+                    </td>
+                    <td>{{ participant.created_at.strftime('%Y-%m-%d') }}</td>
+                    <td class="actions">
+                        <a href="{{ url_for('edit_participant', user_id=participant.id) }}" 
+                           class="btn btn-sm btn-secondary">Edit</a>
+                        <form method="POST" action="{{ url_for('delete_participant', user_id=participant.id) }}" 
+                              style="display: inline;" 
+                              onsubmit="return confirm('Are you sure you want to delete this participant?');">
+                            <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="6" class="text-center">No participants yet</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\admin\settings.html =====
+
+<!-- templates/admin/settings.html -->
+{% extends "base.html" %}
+
+{% block title %}Settings - Admin{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1>⚙️ System Settings</h1>
+    
+    <div class="settings-sections">
+        <!-- Phase Control -->
+        <div class="settings-section">
+            <h2>📍 Phase Control</h2>
+            <div class="setting-item">
+                <div class="setting-info">
+                    <strong>Current Phase:</strong> Phase {{ settings.phase }}
+                    <p>
+                        {% if settings.phase == 1 %}
+                        Registration phase - users can sign up
+                        {% else %}
+                        Assignment phase - users can reveal matches and chat
+                        {% endif %}
+                    </p>
+                </div>
+                <form method="POST" action="{{ url_for('admin_settings') }}">
+                    <input type="hidden" name="action" value="update_phase">
+                    <select name="phase" onchange="this.form.submit()">
+                        <option value="1" {% if settings.phase == 1 %}selected{% endif %}>Phase 1</option>
+                        <option value="2" {% if settings.phase == 2 %}selected{% endif %}>Phase 2</option>
+                    </select>
+                </form>
+            </div>
+            
+            <div class="setting-item">
+                <div class="setting-info">
+                    <strong>Registration:</strong>
+                    {% if settings.registration_open %}Open{% else %}Closed{% endif %}
+                </div>
+                <form method="POST" action="{{ url_for('admin_settings') }}">
+                    <input type="hidden" name="action" value="toggle_registration">
+                    <button type="submit" class="btn btn-secondary">
+                        {% if settings.registration_open %}Close{% else %}Open{% endif %} Registration
+                    </button>
+                </form>
+            </div>
+            
+            <div class="setting-item">
+                <div class="setting-info">
+                    <strong>Chat:</strong>
+                    {% if settings.chat_enabled %}Enabled{% else %}Disabled{% endif %}
+                </div>
+                <form method="POST" action="{{ url_for('admin_settings') }}">
+                    <input type="hidden" name="action" value="toggle_chat">
+                    <button type="submit" class="btn btn-secondary">
+                        {% if settings.chat_enabled %}Disable{% else %}Enable{% endif %} Chat
+                    </button>
+                </form>
+            </div>
+        </div>
+        
+        <!-- SMTP Settings -->
+        <div class="settings-section">
+            <h2>📧 Email (SMTP) Configuration</h2>
+            <form method="POST" action="{{ url_for('admin_settings') }}">
+                <input type="hidden" name="action" value="update_smtp">
+                
+                <div class="form-group">
+                    <label for="smtp_host">SMTP Host</label>
+                    <input type="text" id="smtp_host" name="smtp_host" 
+                           value="{{ settings.smtp_host or '' }}" 
+                           placeholder="smtp.gmail.com">
+                </div>
+                
+                <div class="form-group">
+                    <label for="smtp_port">SMTP Port</label>
+                    <input type="number" id="smtp_port" name="smtp_port" 
+                           value="{{ settings.smtp_port or 587 }}">
+                </div>
+                
+                <div class="form-group">
+                    <label for="smtp_user">SMTP Username/Email</label>
+                    <input type="text" id="smtp_user" name="smtp_user" 
+                           value="{{ settings.smtp_user or '' }}" 
+                           placeholder="your-email@gmail.com">
+                </div>
+                
+                <div class="form-group">
+                    <label for="smtp_password">SMTP Password</label>
+                    <input type="password" id="smtp_password" name="smtp_password" 
+                           placeholder="Leave blank to keep current password">
+                    <small class="form-help">Password is encrypted in database</small>
+                </div>
+                
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" name="smtp_use_tls" 
+                               {% if settings.smtp_use_tls %}checked{% endif %}>
+                        Use TLS
+                    </label>
+                </div>
+                
+                <button type="submit" class="btn btn-primary">Save SMTP Settings</button>
+            </form>
+            
+            <div class="setting-item" style="margin-top: 20px;">
+                <h3>Test Email</h3>
+                <form method="POST" action="{{ url_for('admin_settings') }}">
+                    <input type="hidden" name="action" value="test_email">
+                    <div class="form-group">
+                        <input type="email" name="test_email" 
+                               placeholder="Enter email to send test" required>
+                    </div>
+                    <button type="submit" class="btn btn-secondary">Send Test Email</button>
+                </form>
+            </div>
+        </div>
+        
+        <!-- System Reset -->
+        <div class="settings-section danger-zone">
+            <h2>⚠️ Danger Zone</h2>
+            <div class="setting-item">
+                <div class="setting-info">
+                    <strong>Reset System</strong>
+                    <p>This will delete all participants, assignments, and messages. Use this to prepare for next year's Secret Santa.</p>
+                </div>
+                <form method="POST" action="{{ url_for('admin_settings') }}" 
+                      onsubmit="return confirm('Are you absolutely sure? This cannot be undone!');">
+                    <input type="hidden" name="action" value="reset_system">
+                    <div class="form-group">
+                        <input type="text" name="confirm_reset" 
+                               placeholder="Type RESET to confirm" required>
+                    </div>
+                    <button type="submit" class="btn btn-danger">Reset System</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\admin\setup.html =====
+
+<!-- templates/admin/setup.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Setup - Secret Santa</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="setup-container">
+        <div class="setup-card">
+            <h1>🎅 Welcome to Secret Santa!</h1>
+            <p class="setup-subtitle">Let's create your admin account to get started</p>
+            
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            
+            <form method="POST" action="{{ url_for('admin_setup') }}" class="setup-form">
+                <div class="form-group">
+                    <label for="name">Your Name</label>
+                    <input type="text" id="name" name="name" required 
+                           placeholder="Enter your full name">
+                </div>
+                
+                <div class="form-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" required 
+                           placeholder="admin@company.com">
+                </div>
+                
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required 
+                           placeholder="Enter a strong password" minlength="8">
+                    <small class="form-help">Minimum 8 characters</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="confirm_password">Confirm Password</label>
+                    <input type="password" id="confirm_password" name="confirm_password" required 
+                           placeholder="Re-enter your password">
+                </div>
+                
+                <button type="submit" class="btn btn-primary btn-block">Create Admin Account</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\emails\phase2_announcement.html =====
+
+<!-- templates/emails/phase2_announcement.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+            border-radius: 10px 10px 0 0;
+        }
+        .content {
+            background: #f9f9f9;
+            padding: 30px;
+            border-radius: 0 0 10px 10px;
+        }
+        .highlight-box {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .button {
+            display: inline-block;
+            padding: 15px 40px;
+            background: #f5576c;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            margin: 20px 0;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        .credentials {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid #f5576c;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            color: #666;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎉 Your Secret Santa Match is Ready!</h1>
+    </div>
+    <div class="content">
+        <h2>Hi {{ user.name }},</h2>
+        <p>Exciting news! The moment you've been waiting for is here!</p>
+        
+        <div class="highlight-box">
+            <h3>🎁 Phase 2 is Now Live!</h3>
+            <p>Login to discover who you'll be gifting this year!</p>
+        </div>
+        
+        <div class="credentials">
+            <h3>Your Login Credentials:</h3>
+            <p><strong>Email:</strong> {{ user.email }}</p>
+            <p><strong>Employee ID:</strong> {{ user.emp_id }}</p>
+        </div>
+        
+        <div style="text-align: center;">
+            <a href="{{ login_url }}" class="button">🎲 Reveal Your Match</a>
+        </div>
+        
+        <h3>What You Can Do Now:</h3>
+        <ul>
+            <li>🎲 Experience the exciting reveal animation</li>
+            <li>👤 Learn about your giftee's preferences</li>
+            <li>💬 Chat anonymously to get more gift ideas</li>
+            <li>🎁 Start planning the perfect gift!</li>
+        </ul>
+        
+        <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <p><strong>⚠️ Important Reminders:</strong></p>
+            <ul>
+                <li>Keep your identity secret</li>
+                <li>Respect the budget limit</li>
+                <li>Be thoughtful and kind</li>
+                <li>Have fun! 🎄</li>
+            </ul>
+        </div>
+        
+        <p>Happy Secret Santa!</p>
+        
+        <div class="footer">
+            <p>Secret Santa Application</p>
+            <p>This is an automated email. Please do not reply.</p>
+        </div>
+    </div>
+</body>
+</html>
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\emails\registration_confirmation.html =====
+
+<!-- templates/emails/registration_confirmation.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+            border-radius: 10px 10px 0 0;
+        }
+        .content {
+            background: #f9f9f9;
+            padding: 30px;
+            border-radius: 0 0 10px 10px;
+        }
+        .info-box {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid #667eea;
+        }
+        .button {
+            display: inline-block;
+            padding: 12px 30px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            margin: 20px 0;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            color: #666;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎅 Welcome to Secret Santa!</h1>
+    </div>
+    <div class="content">
+        <h2>Hi {{ user.name }},</h2>
+        <p>Thank you for registering for this year's Secret Santa event! We're excited to have you participate.</p>
+        
+        <div class="info-box">
+            <h3>Your Registration Details:</h3>
+            <p><strong>Name:</strong> {{ user.name }}</p>
+            <p><strong>Employee ID:</strong> {{ user.emp_id }}</p>
+            <p><strong>Email:</strong> {{ user.email }}</p>
+            <p><strong>Your Preferences:</strong> {{ user.preferences }}</p>
+            <p><strong>Budget:</strong> ₹{{ budget }}</p>
+        </div>
+        
+        <h3>What's Next?</h3>
+        <ul>
+            <li>Wait for the Phase 2 announcement email</li>
+            <li>You'll receive your Secret Santa match soon</li>
+            <li>Use the anonymous chat to learn more about your giftee</li>
+            <li>Purchase a thoughtful gift within the budget</li>
+        </ul>
+        
+        <p>We'll notify you as soon as the assignments are ready!</p>
+        
+        <p>Happy Gifting! 🎁</p>
+        
+        <div class="footer">
+            <p>Secret Santa Application</p>
+            <p>This is an automated email. Please do not reply.</p>
+        </div>
+    </div>
+</body>
+</html>
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\errors\404.html =====
+
+<!-- templates/errors/404.html -->
+{% extends "base.html" %}
+
+{% block title %}Page Not Found{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="error-container">
+        <div class="error-code">404</div>
+        <h1>Page Not Found</h1>
+        <p>Oops! The page you're looking for doesn't exist.</p>
+        <a href="{{ url_for('index') }}" class="btn btn-primary">Go to Home</a>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\errors\500.html =====
+
+<!-- templates/errors/500.html -->
+{% extends "base.html" %}
+
+{% block title %}Server Error{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="error-container">
+        <div class="error-code">500</div>
+        <h1>Internal Server Error</h1>
+        <p>Something went wrong on our end. Please try again later.</p>
+        <a href="{{ url_for('index') }}" class="btn btn-primary">Go to Home</a>
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\user\chat.html =====
+
+<!-- templates/user/chat.html -->
+{% extends "base.html" %}
+
+{% block title %}Anonymous Chat - Secret Santa{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="chat-container">
+        <div class="chat-header">
+            <h2>💬 Anonymous Chat</h2>
+            <p>Chatting with your giftee (anonymously)</p>
+        </div>
+        
+        <div class="chat-messages" id="chatMessages">
+            {% for message in messages %}
+            <div class="message {% if message.sender_type == 'gifter' %}message-sent{% else %}message-received{% endif %}">
+                <div class="message-content">
+                    <p>{{ message.message_text }}</p>
+                    <span class="message-time">{{ message.timestamp.strftime('%I:%M %p') }}</span>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        
+        <div class="chat-input-container">
+            <form id="chatForm" class="chat-form">
+                <input type="text" id="messageInput" placeholder="Type your message..." 
+                       autocomplete="off" maxlength="500">
+                <button type="submit" class="btn btn-primary">Send</button>
+            </form>
+            <small class="chat-help">Messages are anonymous. Your giftee won't know who you are.</small>
+        </div>
+    </div>
+</div>
+<script>
+    const chatMode = "{{ chat_mode }}";  // 'gifter' or 'giftee'
+</script>
+    
+
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+<script>
+    const assignmentId = "{{ assignment.id }}";
+</script>
+
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\user\dashboard.html =====
+
+<!-- templates/user/dashboard.html -->
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Secret Santa{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="dashboard-header">
+        <h1>Welcome back, {{ user.name }}! 🎅</h1>
+        <p class="subtitle">Your Secret Santa Dashboard</p>
+    </div>
+    
+    <div class="dashboard-grid">
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>🎁 Your Giftee</h2>
+            </div>
+            <div class="card-body">
+                <div class="giftee-info">
+                    <div class="info-row">
+                        <span class="label">Name:</span>
+                        <span class="value">{{ giftee.name }}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">Employee ID:</span>
+                        <span class="value">{{ giftee.emp_id }}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">Preferences:</span>
+                        <span class="value">{{ giftee.preferences }}</span>
+                    </div>
+                    {% if giftee.address %}
+                    <div class="info-row">
+                        <span class="label">Address:</span>
+                        <span class="value">{{ giftee.address }}</span>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>💬 Anonymous Chat</h2>
+                {% if unread_count > 0 %}
+                <span class="badge">{{ unread_count }} new</span>
+                {% endif %}
+            </div>
+            <div class="card-body">
+                <p>Communicate with your giftee anonymously to learn more about their preferences!</p>
+                <a href="{{ url_for('chat') }}" class="btn btn-primary">Open Chat</a>
+            </div>
+        </div>
+        
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>📋 Event Details</h2>
+            </div>
+            <div class="card-body">
+                <div class="info-row">
+                    <span class="label">Budget:</span>
+                    <span class="value">₹{{ budget }}</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Revealed On:</span>
+                    <span class="value">{{ assignment.reveal_time.strftime('%B %d, %Y at %I:%M %p') if assignment.reveal_time else 'N/A' }}</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="dashboard-card">
+            <div class="card-header">
+                <h2>ℹ️ Important Notes</h2>
+            </div>
+            <div class="card-body">
+                <ul class="notes-list">
+                    <li>Keep your identity secret from your giftee</li>
+                    <li>Stay within the budget of ₹{{ budget }}</li>
+                    <li>Use the anonymous chat to ask questions</li>
+                    <li>Have fun and spread joy! 🎄</li>
+                </ul>
+            </div>
+        </div>
+        <div class="chat-cards">
+
+            <!-- Chat as Gifter -->
+            <div class="card">
+                <h3>Chat with Your Giftee</h3>
+                <p>Your giftee: {{ giftee.name }}</p>
+                <a href="{{ url_for('chat_as_gifter') }}" class="btn btn-primary">
+                    Open Chat
+                </a>
+            </div>
+        
+            <!-- Chat as Giftee -->
+            <div class="card">
+                <h3>Chat with Your Secret Santa</h3>
+                <p>Your gifter: {{ gifter.name }}</p>
+                <a href="{{ url_for('chat_as_giftee') }}" class="btn btn-secondary">
+                    Open Chat
+                </a>
+            </div>
+        
+        </div>
+        
+    </div>
+</div>
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\templates\user\reveal.html =====
+
+<!-- templates/user/reveal.html -->
+{% extends "base.html" %}
+
+{% block title %}Reveal Your Match - Secret Santa{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/animations.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="reveal-container">
+        <h1>🎉 Discover Your Secret Santa Match!</h1>
+        <p class="reveal-subtitle">Spin the wheel to reveal who you'll be gifting...</p>
+        
+        {% if animation_type == 'spin' %}
+        <div class="spin-wheel-container">
+            <canvas id="wheelCanvas" width="500" height="500"></canvas>
+            <button id="spinButton" class="btn btn-primary btn-lg spin-btn">
+                🎲 SPIN THE WHEEL
+            </button>
+        </div>
+        {% else %}
+        <div class="scratch-cards-container">
+            <h2>Choose a card to scratch and reveal your match!</h2>
+            <div class="cards-grid">
+                <div class="scratch-card-wrapper">
+                    <canvas class="scratch-card" data-card="1"></canvas>
+                    <div class="card-back">{{ giftee_name }}</div>
+                </div>
+                <div class="scratch-card-wrapper">
+                    <canvas class="scratch-card" data-card="2"></canvas>
+                    <div class="card-back">{{ giftee_name }}</div>
+                </div>
+                <div class="scratch-card-wrapper">
+                    <canvas class="scratch-card" data-card="3"></canvas>
+                    <div class="card-back">{{ giftee_name }}</div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+        
+        <div id="resultModal" class="modal">
+            <div class="modal-content">
+                <h2>🎁 Your Secret Santa Match Is...</h2>
+                <div class="giftee-reveal">
+                    <h1 id="gifteeName">{{ giftee_name }}</h1>
+                </div>
+                <p>Get ready to make their day special!</p>
+                <a href="{{ url_for('user_dashboard') }}" class="btn btn-primary">Go to Dashboard</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const gifteeName = "{{ giftee_name }}";
+    const animationType = "{{ animation_type }}";
+</script>
+{% endblock %}
+
+{% block extra_js %}
+{% if animation_type == 'spin' %}
+<script src="{{ url_for('static', filename='js/spin-wheel.js') }}"></script>
+{% else %}
+<script src="{{ url_for('static', filename='js/scratch-card.js') }}"></script>
+{% endif %}
+{% endblock %}
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\utils\assignment_logic.py =====
+
+# utils/assignment_logic.py
+import random
+from models import User, Assignment, db
+
+class AssignmentGenerator:
+    @staticmethod
+    def generate_assignments():
+        """
+        Generate Secret Santa assignments ensuring:
+        1. No self-assignment
+        2. No cycles of 2 (A->B, B->A)
+        3. Each person is both a gifter and giftee exactly once
+        """
+        users = User.query.all()
+        
+        if len(users) < 3:
+            raise ValueError("Need at least 3 participants for Secret Santa")
+        
+        # Clear existing assignments
+        Assignment.query.delete()
+        
+        # Create a derangement (permutation where no element appears in its original position)
+        assignments = AssignmentGenerator._create_derangement([u.id for u in users])
+        
+        # Create assignment records
+        for gifter_id, giftee_id in assignments.items():
+            assignment = Assignment(
+                gifter_user_id=gifter_id,
+                giftee_user_id=giftee_id
+            )
+            db.session.add(assignment)
+        
+        db.session.commit()
+        return len(assignments)
+    
+    @staticmethod
+    def _create_derangement(ids):
+        """
+        Create a derangement - a permutation where no element maps to itself
+        and avoid immediate cycles (A->B, B->A)
+        """
+        max_attempts = 1000
+        
+        for _ in range(max_attempts):
+            shuffled = ids.copy()
+            random.shuffle(shuffled)
+            
+            # Check if valid derangement
+            valid = True
+            assignments = {}
+            
+            for i, original_id in enumerate(ids):
+                new_id = shuffled[i]
+                
+                # No self-assignment
+                if original_id == new_id:
+                    valid = False
+                    break
+                
+                # No immediate cycles
+                if new_id in assignments and assignments[new_id] == original_id:
+                    valid = False
+                    break
+                
+                assignments[original_id] = new_id
+            
+            if valid:
+                return assignments
+        
+        # Fallback: simple rotation (guaranteed to work)
+        return {ids[i]: ids[(i + 1) % len(ids)] for i in range(len(ids))}
+    
+    @staticmethod
+    def get_assignment_map():
+        """Get all assignments for admin view"""
+        assignments = Assignment.query.all()
+        result = []
+        
+        for assignment in assignments:
+            result.append({
+                'id': assignment.id,
+                'gifter': {
+                    'id': assignment.gifter.id,
+                    'name': assignment.gifter.name,
+                    'emp_id': assignment.gifter.emp_id,
+                    'email': assignment.gifter.email
+                },
+                'giftee': {
+                    'id': assignment.giftee.id,
+                    'name': assignment.giftee.name,
+                    'emp_id': assignment.giftee.emp_id,
+                    'email': assignment.giftee.email,
+                    'preferences': assignment.giftee.preferences,
+                    'address': assignment.giftee.address
+                },
+                'reveal_completed': assignment.reveal_completed,
+                'reveal_time': assignment.reveal_time.isoformat() if assignment.reveal_time else None
+            })
+        
+        return result
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\utils\auth.py =====
+
+# utils/auth.py
+from functools import wraps
+from flask import session, abort
+from datetime import datetime, timedelta
+from models import LoginAttempt
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'admin_id' not in session:
+            # show 404 for unauthorised access
+            abort(404)
+        return f(*args, **kwargs)
+    return decorated_function
+
+def user_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            # show 404 for unauthorised access
+            abort(404)
+        return f(*args, **kwargs)
+    return decorated_function
+
+def check_rate_limit(ip_address, max_attempts=5, window_minutes=15):
+    """Check if IP has exceeded login attempts"""
+    cutoff_time = datetime.utcnow() - timedelta(minutes=window_minutes)
+
+    recent_attempts = LoginAttempt.query.filter(
+        LoginAttempt.ip_address == ip_address,
+        LoginAttempt.timestamp > cutoff_time,
+        LoginAttempt.success == False
+    ).count()
+
+    return recent_attempts < max_attempts
+
+def log_login_attempt(ip_address, email, success):
+    """Log a login attempt"""
+    attempt = LoginAttempt(
+        ip_address=ip_address,
+        email=email,
+        success=success
+    )
+    from models import db
+    db.session.add(attempt)
+    db.session.commit()
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\utils\email_service.py =====
+
+# utils/email_service.py
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from flask import render_template, current_app
+from models import SystemSettings
+
+# utils/email_service.py (replace send_email method)
+
+class EmailService:
+    @staticmethod
+    def get_smtp_config():
+        settings = SystemSettings.query.first()
+        if not settings:
+            return None
+
+        return {
+            'host': settings.smtp_host,
+            'port': settings.smtp_port,
+            'user': settings.smtp_user,
+            'password': settings.get_smtp_password(),
+            'use_tls': settings.smtp_use_tls
+        }
+
+    @staticmethod
+    def send_email(to_email, subject, html_content, text_content=None):
+        config = EmailService.get_smtp_config()
+        if not config or not all([config.get('host'), config.get('user'), config.get('password')]):
+            current_app.logger.error("SMTP not configured properly")
+            return False
+
+        try:
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = config['user']
+            msg['To'] = to_email
+
+            if text_content:
+                part1 = MIMEText(text_content, 'plain')
+                msg.attach(part1)
+
+            part2 = MIMEText(html_content, 'html')
+            msg.attach(part2)
+
+            # Use SMTP_SSL for port 465, otherwise use starttls()
+            if config.get('port') == 465:
+                server = smtplib.SMTP_SSL(config['host'], config['port'], timeout=10)
+                server.ehlo()
+            else:
+                server = smtplib.SMTP(config['host'], config['port'], timeout=10)
+                server.ehlo()
+                if config.get('use_tls', True):
+                    server.starttls()
+                    server.ehlo()
+
+            server.login(config['user'], config['password'])
+            server.send_message(msg)
+            server.quit()
+            return True
+        except Exception as e:
+            current_app.logger.error(f"Error sending email: {str(e)}")
+            return False
+    
+    @staticmethod
+    def send_registration_confirmation(user):
+        html_content = render_template('emails/registration_confirmation.html', 
+                                      user=user,
+                                      budget=current_app.config['GIFT_BUDGET'])
+        
+        text_content = f"""
+        Hi {user.name},
+        
+        Thank you for registering for Secret Santa!
+        
+        Your Details:
+        - Employee ID: {user.emp_id}
+        - Email: {user.email}
+        - Gift Preferences: {user.preferences}
+        
+        You will receive your Secret Santa match when Phase 2 begins. Stay tuned!
+        
+        Best regards,
+        Secret Santa Team
+        """
+        
+        return EmailService.send_email(
+            user.email,
+            "Secret Santa Registration Confirmed",
+            html_content,
+            text_content
+        )
+    
+    @staticmethod
+    def send_phase2_announcement(user, login_url):
+        html_content = render_template('emails/phase2_announcement.html',
+                                      user=user,
+                                      login_url=login_url)
+        
+        text_content = f"""
+        Hi {user.name},
+        
+        Exciting news! The Secret Santa assignments are ready!
+        
+        Login to discover your giftee:
+        {login_url}
+        
+        Use your email ({user.email}) and Employee ID ({user.emp_id}) to login.
+        
+        Best regards,
+        Secret Santa Team
+        """
+        
+        return EmailService.send_email(
+            user.email,
+            "Your Secret Santa Match is Ready!",
+            html_content,
+            text_content
+        )
+    
+    @staticmethod
+    def send_new_message_notification(user, is_gifter):
+        role = "Secret Santa" if is_gifter else "your giftee"
+        
+        html_content = f"""
+        <html>
+            <body>
+                <h2>New Message!</h2>
+                <p>Hi {user.name},</p>
+                <p>You have received a new message from {role} in the Secret Santa chat.</p>
+                <p><a href="{{{{ url }}}}">Click here to view</a></p>
+            </body>
+        </html>
+        """
+        
+        text_content = f"""
+        Hi {user.name},
+        
+        You have received a new message from {role} in the Secret Santa chat.
+        
+        Login to view your messages.
+        """
+        
+        return EmailService.send_email(
+            user.email,
+            "New Secret Santa Message",
+            html_content,
+            text_content
+        )
+
+
+===== FILE: C:\Users\Nitin\Desktop\Credit card app\utils\__init__.py =====
+
+# utils/__init__.py
+from .email_service import EmailService
+from .assignment_logic import AssignmentGenerator
+from .auth import admin_required, user_required, check_rate_limit, log_login_attempt
+
+__all__ = [
+    'EmailService',
+    'AssignmentGenerator',
+    'admin_required',
+    'user_required',
+    'check_rate_limit',
+    'log_login_attempt'
+]

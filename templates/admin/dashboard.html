@@ -1,0 +1,99 @@
+<!-- templates/admin/dashboard.html -->
+{% extends "base.html" %}
+
+{% block title %}Admin Dashboard - Secret Santa{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="admin-header">
+        <h1>🎅 Admin Dashboard</h1>
+        <div class="phase-indicator">
+            <span class="phase-badge phase-{{ settings.phase }}">
+                Phase {{ settings.phase }}
+            </span>
+        </div>
+    </div>
+    
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-icon">👥</div>
+            <div class="stat-content">
+                <h3>{{ stats.total_participants }}</h3>
+                <p>Total Participants</p>
+            </div>
+        </div>
+        
+        <div class="stat-card">
+            <div class="stat-icon">🎁</div>
+            <div class="stat-content">
+                <h3>{{ stats.reveals_completed }}</h3>
+                <p>Reveals Completed</p>
+            </div>
+        </div>
+        
+        <div class="stat-card">
+            <div class="stat-icon">💬</div>
+            <div class="stat-content">
+                <h3>{{ stats.total_messages }}</h3>
+                <p>Chat Messages</p>
+            </div>
+        </div>
+        
+        <div class="stat-card">
+            <div class="stat-icon">✅</div>
+            <div class="stat-content">
+                <h3>{% if stats.assignments_generated %}Yes{% else %}No{% endif %}</h3>
+                <p>Assignments Generated</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="admin-actions">
+        <h2>Quick Actions</h2>
+        <div class="actions-grid">
+            <a href="{{ url_for('admin_participants') }}" class="action-card">
+                <div class="action-icon">👥</div>
+                <h3>View Participants</h3>
+                <p>Manage registered users</p>
+            </a>
+            
+            <a href="{{ url_for('admin_assignments') }}" class="action-card">
+                <div class="action-icon">🎲</div>
+                <h3>Assignments</h3>
+                <p>Generate and manage matches</p>
+            </a>
+            
+            <a href="{{ url_for('admin_settings') }}" class="action-card">
+                <div class="action-icon">⚙️</div>
+                <h3>Settings</h3>
+                <p>Configure system settings</p>
+            </a>
+            
+            {% if settings.admin_can_view_chats %}
+            <a href="{{ url_for('admin_chats') }}" class="action-card">
+                <div class="action-icon">💬</div>
+                <h3>Monitor Chats</h3>
+                <p>View anonymous conversations</p>
+            </a>
+            {% endif %}
+        </div>
+    </div>
+    
+    <div class="phase-control">
+        <h2>Phase Control</h2>
+        <div class="phase-info">
+            {% if settings.phase == 1 %}
+            <p><strong>Current Phase:</strong> Registration Phase</p>
+            <p>Users can register for Secret Santa. Generate assignments before moving to Phase 2.</p>
+            {% else %}
+            <p><strong>Current Phase:</strong> Assignment & Chat Phase</p>
+            <p>Users can login, reveal their matches, and chat anonymously.</p>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

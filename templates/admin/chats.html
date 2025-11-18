@@ -1,0 +1,57 @@
+<!-- templates/admin/chats.html -->
+{% extends "base.html" %}
+
+{% block title %}Chat Monitoring - Admin{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>💬 Chat Monitoring</h1>
+        <p class="subtitle">View anonymous conversations between gifters and giftees</p>
+    </div>
+    
+    {% if chat_data %}
+    <div class="chats-list">
+        {% for data in chat_data %}
+        <div class="chat-card">
+            <div class="chat-card-header">
+                <h3>{{ data.gifter.name }} → {{ data.giftee.name }}</h3>
+                <span class="message-count">{{ data.messages|length }} messages</span>
+            </div>
+            <div class="chat-card-body">
+                {% if data.messages %}
+                <div class="messages-preview">
+<!-- templates/admin/chats.html (continued) -->
+                    {% for message in data.messages %}
+                    <div class="message-preview {% if message.sender_type == 'gifter' %}from-gifter{% else %}from-giftee{% endif %}">
+                        <span class="sender-label">
+                            {% if message.sender_type == 'gifter' %}
+                            Gifter ({{ data.gifter.name }})
+                            {% else %}
+                            Giftee ({{ data.giftee.name }})
+                            {% endif %}
+                        </span>
+                        <p>{{ message.message_text }}</p>
+                        <span class="message-timestamp">{{ message.timestamp.strftime('%Y-%m-%d %I:%M %p') }}</span>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <p class="no-messages">No messages yet</p>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>No chats to display. Users haven't revealed their matches yet.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+

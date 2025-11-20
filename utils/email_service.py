@@ -4,29 +4,51 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import render_template, current_app
 from models import SystemSettings
+import os
 
 # utils/email_service.py (replace send_email method)
 
 class EmailService:
     @staticmethod
     def get_smtp_config():
+        """Get SMTP config from database or environment variables"""
         settings = SystemSettings.query.first()
-        if not settings:
-            return None
-
-        return {
-            'host': settings.smtp_host,
-            'port': settings.smtp_port,
-            'user': settings.smtp_user,
-            'password': settings.get_smtp_password(),
-            'use_tls': settings.smtp_use_tls
-        }
+        
+        # Try to get from database first
+        if settings and settings.smtp_host and settings.smtp_user:
+            password = settings.get_smtp_password()
+            if password:
+                return {
+                    'host': settings.smtp_host,
+                    'port': settings.smtp_port,
+                    'user': settings.smtp_user,
+                    'password': password,
+                    'use_tls': settings.smtp_use_tls
+                }
+        
+        # Fallback to environment variables
+        smtp_host = os.environ.get('SMTP_HOST')
+        smtp_port = int(os.environ.get('SMTP_PORT', 587))
+        smtp_user = os.environ.get('SMTP_USER')
+        smtp_password = os.environ.get('SMTP_PASSWORD')
+        smtp_use_tls = os.environ.get('SMTP_USE_TLS', 'true').lower() == 'true'
+        
+        if smtp_host and smtp_user and smtp_password:
+            return {
+                'host': smtp_host,
+                'port': smtp_port,
+                'user': smtp_user,
+                'password': smtp_password,
+                'use_tls': smtp_use_tls
+            }
+        
+        return None
 
     @staticmethod
     def send_email(to_email, subject, html_content, text_content=None):
         config = EmailService.get_smtp_config()
         if not config or not all([config.get('host'), config.get('user'), config.get('password')]):
-            current_app.logger.error("SMTP not configured properly")
+            current_app.logger.error("SMTP not configured properly. Please set SMTP settings in admin panel or .env file")
             return False
 
         try:
@@ -42,23 +64,48 @@ class EmailService:
             part2 = MIMEText(html_content, 'html')
             msg.attach(part2)
 
-            # Use SMTP_SSL for port 465, otherwise use starttls()
-            if config.get('port') == 465:
-                server = smtplib.SMTP_SSL(config['host'], config['port'], timeout=10)
-                server.ehlo()
-            else:
-                server = smtplib.SMTP(config['host'], config['port'], timeout=10)
-                server.ehlo()
-                if config.get('use_tls', True):
-                    server.starttls()
+            # Use SMTP_SSL for port 465, otherwise use SMTP with starttls
+            server = None
+            try:
+                if config.get('port') == 465:
+                    # Port 465 requires SMTP_SSL from the start
+                    current_app.logger.info(f"Connecting to {config['host']}:465 with SSL")
+                    server = smtplib.SMTP_SSL(config['host'], 465, timeout=30)
+                else:
+                    # Port 587 or other ports use STARTTLS
+                    current_app.logger.info(f"Connecting to {config['host']}:{config['port']} with STARTTLS")
+                    server = smtplib.SMTP(config['host'], config['port'], timeout=30)
                     server.ehlo()
+                    if config.get('use_tls', True):
+                        server.starttls()
+                        server.ehlo()
 
-            server.login(config['user'], config['password'])
-            server.send_message(msg)
-            server.quit()
-            return True
+                current_app.logger.info(f"Logging in as {config['user']}")
+                server.login(config['user'], config['password'])
+                
+                current_app.logger.info(f"Sending email to {to_email}")
+                server.send_message(msg)
+                server.quit()
+                
+                current_app.logger.info(f"Email sent successfully to {to_email}")
+                return True
+            except smtplib.SMTPAuthenticationError as e:
+                current_app.logger.error(f"SMTP Authentication failed: {str(e)}")
+                current_app.logger.error("Please check your SMTP username and password")
+                return False
+            except smtplib.SMTPException as e:
+                current_app.logger.error(f"SMTP error: {str(e)}")
+                return False
+            finally:
+                if server:
+                    try:
+                        server.quit()
+                    except:
+                        pass
         except Exception as e:
             current_app.logger.error(f"Error sending email: {str(e)}")
+            import traceback
+            current_app.logger.error(traceback.format_exc())
             return False
     
     @staticmethod

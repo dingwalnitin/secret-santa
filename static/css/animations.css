@@ -5,6 +5,11 @@
     max-width: 800px;
     margin: 2rem auto;
     text-align: center;
+    background: linear-gradient(135deg, rgba(255, 255, 255, 0.9) 0%, rgba(255, 248, 220, 0.9) 100%);
+    padding: 2rem;
+    border-radius: 20px;
+    box-shadow: 0 15px 40px rgba(196, 30, 58, 0.15);
+    border: 1px solid rgba(255, 215, 0, 0.2);
 }
 
 .reveal-container h1 {
@@ -30,9 +35,10 @@
     align-items: center;
     gap: 2rem;
     padding: 2rem;
-    background: white;
+    background: linear-gradient(135deg, #ffffff 0%, #fff8dc 100%);
     border-radius: 20px;
     box-shadow: var(--shadow-lg);
+    border: 1px solid rgba(255, 215, 0, 0.2);
 }
 
 #wheelCanvas {
@@ -68,9 +74,10 @@
 /* Scratch Cards Container */
 .scratch-cards-container {
     padding: 2rem;
-    background: white;
+    background: linear-gradient(135deg, #ffffff 0%, #fff8dc 100%);
     border-radius: 20px;
     box-shadow: var(--shadow-lg);
+    border: 1px solid rgba(255, 215, 0, 0.2);
 }
 
 .scratch-cards-container h2 {
@@ -119,7 +126,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
     color: white;
     font-size: 2rem;
     font-weight: bold;
@@ -127,6 +134,7 @@
     text-align: center;
     word-wrap: break-word;
     z-index: 1;
+    border: 2px solid rgba(255, 215, 0, 0.3);
 }
 
 /* Scratch Effect */
@@ -192,10 +200,11 @@
 
 .giftee-reveal {
     padding: 2rem;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
     border-radius: 15px;
     margin: 2rem 0;
     animation: revealPulse 1s ease;
+    box-shadow: 0 15px 40px rgba(196, 30, 58, 0.3);
 }
 
 @keyframes revealPulse {
@@ -238,6 +247,17 @@
     }
 }
 
+@keyframes confetti-snowflake-fall {
+    0% {
+        transform: translateY(-100vh) rotate(0deg) scale(1);
+        opacity: 1;
+    }
+    100% {
+        transform: translateY(100vh) rotate(360deg) scale(0.5);
+        opacity: 0;
+    }
+}
+
 .confetti {
     position: fixed;
     width: 10px;
@@ -246,6 +266,22 @@
     top: -10px;
     animation: confetti-fall 3s linear;
     z-index: 9999;
+}
+
+.confetti.snowflake {
+    animation: confetti-snowflake-fall 4s linear;
+    background: white;
+    box-shadow: 0 0 5px rgba(255, 255, 255, 0.8);
+}
+
+.confetti.gold {
+    background: var(--accent-color);
+    box-shadow: 0 0 8px rgba(255, 215, 0, 0.6);
+}
+
+.confetti.green {
+    background: var(--secondary-color);
+    box-shadow: 0 0 8px rgba(22, 91, 51, 0.6);
 }
 
 /* Sparkle Effect */

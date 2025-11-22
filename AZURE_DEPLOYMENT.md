@@ -28,12 +28,15 @@ REDIS_NAME="secret-santa-redis"
 az group create --name $RESOURCE_GROUP --location $LOCATION
 
 # Create Azure SQL Server
+# ⚠️ IMPORTANT: Replace 'YourStrongPassword123!' with a strong, unique password
+# Use a password manager to generate a secure password (min 16 chars, mixed case, numbers, symbols)
+# Store the password securely - you'll need it for the connection string
 az sql server create \
   --name $DB_SERVER \
   --resource-group $RESOURCE_GROUP \
   --location $LOCATION \
   --admin-user sqladmin \
-  --admin-password 'YourStrongPassword123!'
+  --admin-password 'REPLACE_WITH_STRONG_PASSWORD'
 
 # Create Azure SQL Database (S1 tier recommended for 200+ users)
 az sql db create \
@@ -110,11 +113,12 @@ Set environment variables:
 
 ```bash
 # Database connection
+# ⚠️ Replace sqladmin and password with your actual Azure SQL credentials
 az webapp config appsettings set \
   --name $APP_NAME \
   --resource-group $RESOURCE_GROUP \
   --settings \
-    DATABASE_URL="mssql+pyodbc://sqladmin:YourStrongPassword123!@${DB_SERVER}.database.windows.net:1433/${DB_NAME}?driver=ODBC+Driver+17+for+SQL+Server&Encrypt=yes&TrustServerCertificate=no&Connection+Timeout=30"
+    DATABASE_URL="mssql+pyodbc://sqladmin:YOUR_SQL_PASSWORD@${DB_SERVER}.database.windows.net:1433/${DB_NAME}?driver=ODBC+Driver+17+for+SQL+Server&Encrypt=yes&TrustServerCertificate=no&Connection+Timeout=30"
 
 # Redis connection
 az webapp config appsettings set \

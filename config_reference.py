@@ -8,6 +8,8 @@
 
 import os
 from datetime import timedelta
+# Uncomment the following imports if using Redis features:
+# import redis
 
 class Config:
     """Base configuration"""

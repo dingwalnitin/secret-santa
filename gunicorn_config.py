@@ -24,6 +24,8 @@ backlog = 2048
 
 # Number of worker processes for handling requests
 # Formula: (2 × CPU cores) + 1
+# This formula is optimized for I/O-bound applications (like this Flask app with database and network I/O).
+# For CPU-bound workloads, use a lower multiplier (1 × CPU cores) or adjust based on load testing.
 # Can be overridden with GUNICORN_WORKERS environment variable
 workers = int(os.environ.get('GUNICORN_WORKERS', multiprocessing.cpu_count() * 2 + 1))
 

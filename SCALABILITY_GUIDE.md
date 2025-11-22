@@ -177,6 +177,9 @@ Ensure the connection string is properly formatted:
 
 ```bash
 # In .env or Azure App Settings
+# ⚠️ IMPORTANT: Replace username, password, server, and dbname with your actual Azure SQL credentials
+# NEVER commit real credentials to version control!
+# Get the actual connection string from Azure Portal → SQL Database → Connection Strings
 DATABASE_URL=mssql+pyodbc://username:password@server.database.windows.net:1433/dbname?driver=ODBC+Driver+17+for+SQL+Server&Encrypt=yes&TrustServerCertificate=no&Connection+Timeout=30
 ```
 

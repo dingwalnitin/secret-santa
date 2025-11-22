@@ -12,6 +12,11 @@ import random
 import logging
 
 # Sample user data for testing
+# NOTE: These are example test users for load testing purposes only.
+# For actual load testing, you should either:
+# 1. Create these test users in your database before running the test, OR
+# 2. Modify these credentials to match actual test users in your database
+# DO NOT use real user credentials for load testing!
 SAMPLE_USERS = [
     {"email": f"user{i}@example.com", "emp_id": f"EMP{i:03d}"} 
     for i in range(1, 51)  # 50 test users

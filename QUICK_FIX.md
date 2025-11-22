@@ -72,6 +72,8 @@ In Azure Portal → Your App Service:
 **Application Settings (Environment Variables):**
 ```bash
 # Required
+# ⚠️ WARNING: Replace with your actual Azure SQL credentials from Azure Portal
+# NEVER commit real credentials to version control!
 DATABASE_URL=mssql+pyodbc://user:pass@server.database.windows.net:1433/dbname?driver=ODBC+Driver+17+for+SQL+Server&Encrypt=yes&TrustServerCertificate=no
 GUNICORN_WORKERS=5
 WORKER_CONNECTIONS=1000

@@ -12,6 +12,10 @@ from utils.assignment_logic import AssignmentGenerator
 from utils.auth import admin_required, user_required, check_rate_limit, log_login_attempt
 from datetime import datetime
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 app = Flask(__name__)

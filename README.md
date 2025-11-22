@@ -2,6 +2,24 @@
 
 A Flask-based Secret Santa gift exchange application with email notifications, user dashboard, and chat features.
 
+## 🚨 Production Deployment & Scalability
+
+**Important:** If you're experiencing crashes with high user loads or deploying to production, please read:
+
+- **[QUICK_FIX.md](QUICK_FIX.md)** - Fast fixes for common scalability issues (START HERE!)
+- **[SCALABILITY_GUIDE.md](SCALABILITY_GUIDE.md)** - Comprehensive scalability and performance guide
+- **[AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md)** - Step-by-step Azure deployment instructions
+
+**Key Issue:** The development server (`python app.py`) cannot handle high loads. Use Gunicorn with the provided `gunicorn_config.py` for production:
+
+```bash
+gunicorn -c gunicorn_config.py app:app
+```
+
+See [QUICK_FIX.md](QUICK_FIX.md) for complete setup instructions.
+
+---
+
 ## Features
 
 - 📝 User registration with preferences
@@ -160,10 +178,12 @@ After configuring SMTP settings:
 ## Technologies Used
 
 - **Backend**: Flask, Flask-SocketIO
-- **Database**: SQLAlchemy (SQLite)
+- **Database**: SQLAlchemy (SQLite for dev, Azure SQL for production)
 - **Real-time**: SocketIO with eventlet
+- **Production Server**: Gunicorn with eventlet workers
 - **Email**: smtplib with encryption
 - **Security**: Werkzeug password hashing, Fernet encryption
+- **Recommended for Production**: Redis (sessions, rate limiting, caching)
 
 ## License
 

@@ -1,0 +1,53 @@
+<!-- templates/index.html -->
+{% extends "base.html" %}
+
+{% block content %}
+<div class="hero">
+    <div class="container">
+        <h1>🎄 Welcome to Secret Santa! 🎁</h1>
+        <p class="subtitle">Spread joy and surprise your colleagues with thoughtful gifts!</p>
+        
+        {% if phase == 1 and registration_open %}
+            <div class="cta-section">
+                <h2>Phase 1: Registration Open!</h2>
+                <p>Sign up now to participate in this year's Secret Santa event</p>
+                <a href="{{ url_for('register') }}" class="btn btn-primary btn-lg">Register Now</a>
+            </div>
+        {% elif phase == 1 and not registration_open %}
+            <div class="info-section">
+                <h2>Registration Closed</h2>
+                <p>Registration has been closed by the admin. Please wait for Phase 2 announcement.</p>
+            </div>
+        {% elif phase == 2 %}
+            <div class="cta-section">
+                <h2>Phase 2: Assignments Ready!</h2>
+                <p>Login to discover your Secret Santa match!</p>
+                <a href="{{ url_for('user_login') }}" class="btn btn-primary btn-lg">Login to Reveal</a>
+            </div>
+        {% endif %}
+        
+        <div class="features">
+            <div class="feature">
+                <div class="feature-icon">📝</div>
+                <h3>Easy Registration</h3>
+                <p>Quick and simple signup process</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">🎲</div>
+                <h3>Random Matching</h3>
+                <p>Fair algorithm ensures everyone gets a match</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">💬</div>
+                <h3>Anonymous Chat</h3>
+                <p>Communicate with your giftee anonymously</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">🎁</div>
+                <h3>Fun Reveal</h3>
+                <p>Exciting animation to reveal your match</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

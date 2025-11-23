@@ -1,0 +1,34 @@
+<!-- templates/login.html -->
+{% extends "base.html" %}
+
+{% block title %}Login - Secret Santa{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="form-container">
+        <h1>🔐 Login to Secret Santa</h1>
+        <p class="form-subtitle">Enter your credentials to see your match</p>
+        
+        <form method="POST" action="{{ url_for('user_login') }}" class="login-form">
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="email" id="email" name="email" required 
+                       placeholder="your.email@company.com">
+            </div>
+            
+            <div class="form-group">
+                <label for="emp_id">Employee ID</label>
+                <input type="text" id="emp_id" name="emp_id" required 
+                       placeholder="Enter your employee ID">
+            </div>
+            
+            <button type="submit" class="btn btn-primary btn-block">Login</button>
+        </form>
+        
+        <div class="form-footer">
+            <p>Not registered yet? Wait for Phase 1 registration period.</p>
+            <p><a href="{{ url_for('index') }}">Back to Home</a></p>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,11 @@
+Flask
+Flask-SQLAlchemy
+Flask-Login
+Flask-SocketIO
+python-socketio
+werkzeug
+python-dotenv
+email-validator
+cryptography
+gunicorn
+eventlet

@@ -1,0 +1,48 @@
+<!-- templates/register_success.html -->
+{% extends "base.html" %}
+
+{% block title %}Registration Successful{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="success-container">
+        <div class="success-icon">✅</div>
+        <h1>Registration Successful!</h1>
+        <p class="success-message">Thank you for registering, {{ user.name }}!</p>
+        
+        <div class="info-box">
+            <h3>What's Next?</h3>
+            <ul class="checklist">
+                <li>✉️ Check your email ({{ user.email }}) for confirmation</li>
+                <li>⏰ Wait for Phase 2 announcement</li>
+                <li>🎁 Prepare to discover your Secret Santa match!</li>
+                <li>💬 Use anonymous chat to learn more about your giftee</li>
+            </ul>
+        </div>
+        
+        <div class="your-details">
+            <h3>Your Registration Details</h3>
+            <table class="details-table">
+                <tr>
+                    <td><strong>Name:</strong></td>
+                    <td>{{ user.name }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Employee ID:</strong></td>
+                    <td>{{ user.emp_id }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Email:</strong></td>
+                    <td>{{ user.email }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Preferences:</strong></td>
+                    <td>{{ user.preferences }}</td>
+                </tr>
+            </table>
+        </div>
+        
+        <a href="{{ url_for('index') }}" class="btn btn-primary">Back to Home</a>
+    </div>
+</div>
+{% endblock %}
